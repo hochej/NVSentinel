@@ -70,6 +70,7 @@ fault-quarantine:
     enabled: true
     percentage: 50
     duration: "5m"
+    scope: "all"
 ```
 
 ### Parameters
@@ -78,10 +79,19 @@ fault-quarantine:
 Enables or disables circuit breaker protection. When disabled, unlimited nodes can be quarantined.
 
 #### percentage
-Maximum percentage of total cluster nodes that can be quarantined within the time window. When exceeded, the circuit breaker trips and blocks all new quarantine actions.
+Maximum percentage of scoped nodes that can be quarantined within the time window. When exceeded, the circuit breaker trips and blocks all new quarantine actions.
 
 #### duration
 Time window for tracking cordon events. The circuit breaker counts unique node cordons within this sliding window.
+
+#### scope
+Node scope used for both the circuit breaker numerator and denominator. Defaults to `all`.
+
+Supported values:
+- `all`: count all Kubernetes nodes. This preserves the previous all-node denominator behavior.
+- `gpu`: count GPU nodes only. GPU nodes are detected from `nvidia.com/gpu` capacity/allocatable or common GPU labels such as `nvidia.com/gpu.present=true`. Use this only when quarantine rules target GPU nodes only.
+
+If the selected scope has zero nodes, quarantine processing fails closed until at least one scoped node is visible.
 
 ### Configuration Examples
 
@@ -91,6 +101,7 @@ circuitBreaker:
   enabled: true
   percentage: 20
   duration: "10m"
+  scope: "gpu"
 ```
 
 Conservative:
@@ -99,6 +110,7 @@ circuitBreaker:
   enabled: true
   percentage: 75
   duration: "3m"
+  scope: "all"
 ```
 
 Disabled:

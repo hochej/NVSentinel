@@ -31,6 +31,7 @@ const (
 // K8sClientOperations defines the minimal interface needed by the circuit breaker
 type K8sClientOperations interface {
 	GetTotalNodes(ctx context.Context) (int, error)
+	GetCircuitBreakerNodeNames(ctx context.Context) (map[string]bool, error)
 	EnsureCircuitBreakerConfigMap(ctx context.Context, name, namespace string, initialStatus State) error
 	ReadCircuitBreakerState(ctx context.Context, name, namespace string) (State, error)
 	WriteCircuitBreakerState(ctx context.Context, name, namespace string, status State) error
@@ -57,8 +58,9 @@ const (
 )
 
 type CircuitBreaker interface {
-	// AddCordonEvent records a node cordoning event in the sliding window
-	AddCordonEvent(nodeName string)
+	// AddCordonEvent records a node cordoning event in the sliding window.
+	// inCircuitBreakerScope is evaluated at cordon time and retained until the event expires.
+	AddCordonEvent(nodeName string, inCircuitBreakerScope bool)
 	// IsTripped checks if the breaker should prevent further cordoning
 	IsTripped(ctx context.Context) (bool, error)
 	// ForceState manually sets the breaker state (CLOSED or TRIPPED)
@@ -77,7 +79,7 @@ type Config struct {
 	// Default: 5 minutes. Events older than this window are automatically discarded.
 	Window time.Duration
 
-	// TripPercentage is the fraction of total nodes that, if exceeded by recent cordon
+	// TripPercentage is the fraction of scoped nodes that, if exceeded by recent cordon
 	// events within Window, will trip the breaker (e.g., 50 for 50%).
 	// Default: 50 (50% of nodes).
 	TripPercentage float64
@@ -104,6 +106,12 @@ type Config struct {
 	MaxRetryDelay time.Duration
 }
 
+// cordonEvent records the bucket and scope membership captured when a node was cordoned.
+type cordonEvent struct {
+	bucketIndex           int
+	inCircuitBreakerScope bool
+}
+
 // slidingWindowBreaker implements CircuitBreaker using a ring buffer approach.
 // It tracks unique nodes that have been cordoned in time-based buckets and automatically
 // expires old events as the window slides forward.
@@ -124,8 +132,8 @@ type slidingWindowBreaker struct {
 	startTime time.Time
 
 	// Node tracking for unique cordon events within the sliding window
-	// nodeToIndex maps node name to the bucket index where it was last cordoned
-	nodeToIndex map[string]int
+	// nodeToEvent maps node name to the cordon event captured for the current window
+	nodeToEvent map[string]cordonEvent
 	// indexToNodes maps bucket index to a set of node names cordoned in that bucket
 	indexToNodes map[int]map[string]bool
 

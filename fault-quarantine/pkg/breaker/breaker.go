@@ -38,9 +38,14 @@ const (
 )
 
 var (
-	// ErrRetryExhausted signals that GetTotalNodes retry attempts were exhausted
-	// This error should trigger pod restart
+	// ErrRetryExhausted signals that node count retry attempts were exhausted.
+	// This error should trigger pod restart.
 	ErrRetryExhausted = errors.New("circuit breaker: all retry attempts exhausted")
+
+	// ErrEmptyCircuitBreakerScope signals that the configured circuit breaker scope
+	// currently has no nodes. Quarantine should fail closed, but this is not a
+	// cache-sync failure and should not force a restart loop.
+	ErrEmptyCircuitBreakerScope = errors.New("circuit breaker: empty node scope")
 )
 
 // NewSlidingWindowBreaker creates a new sliding window circuit breaker for fault quarantine.
@@ -54,7 +59,7 @@ func NewSlidingWindowBreaker(ctx context.Context, cfg Config) (CircuitBreaker, e
 		buckets:      make([]int, numBuckets),
 		startTime:    time.Now(),
 		state:        StateClosed,
-		nodeToIndex:  make(map[string]int),
+		nodeToEvent:  make(map[string]cordonEvent),
 		indexToNodes: make(map[int]map[string]bool),
 	}
 
@@ -95,7 +100,7 @@ func (b *slidingWindowBreaker) slideWindow(now time.Time) {
 			b.buckets[i] = 0
 		}
 
-		maps.Clear(b.nodeToIndex)
+		maps.Clear(b.nodeToEvent)
 
 		for i := range b.indexToNodes {
 			maps.Clear(b.indexToNodes[i])
@@ -110,7 +115,7 @@ func (b *slidingWindowBreaker) slideWindow(now time.Time) {
 		// Clean up node mappings for the bucket being shifted out (bucket 0)
 		if expiredNodes, ok := b.indexToNodes[0]; ok {
 			for nodeName := range expiredNodes {
-				delete(b.nodeToIndex, nodeName)
+				delete(b.nodeToEvent, nodeName)
 			}
 		}
 
@@ -126,8 +131,9 @@ func (b *slidingWindowBreaker) slideWindow(now time.Time) {
 		b.indexToNodes[len(b.indexToNodes)-1] = make(map[string]bool)
 
 		// Update all node indices (decrement by 1)
-		for nodeName, index := range b.nodeToIndex {
-			b.nodeToIndex[nodeName] = index - 1
+		for nodeName, event := range b.nodeToEvent {
+			event.bucketIndex--
+			b.nodeToEvent[nodeName] = event
 		}
 
 		b.startTime = b.startTime.Add(b.bucketSize)
@@ -136,8 +142,10 @@ func (b *slidingWindowBreaker) slideWindow(now time.Time) {
 
 // AddCordonEvent records a new node cordoning event in the sliding window.
 // It advances the ring buffer to the current time and tracks the node uniquely
-// within the sliding window. This method is thread-safe.
-func (b *slidingWindowBreaker) AddCordonEvent(nodeName string) {
+// within the sliding window. Scope membership is captured at cordon time so
+// later node deletion or label/capacity changes do not remove the event from
+// the numerator before it expires. This method is thread-safe.
+func (b *slidingWindowBreaker) AddCordonEvent(nodeName string, inCircuitBreakerScope bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -146,42 +154,55 @@ func (b *slidingWindowBreaker) AddCordonEvent(nodeName string) {
 
 	currentBucketIndex := len(b.buckets) - 1
 
+	eventInCircuitBreakerScope := inCircuitBreakerScope
+
 	// Check if this node was already cordoned in the current window
-	if oldIndex, exists := b.nodeToIndex[nodeName]; exists {
+	if oldEvent, exists := b.nodeToEvent[nodeName]; exists {
+		// Preserve a scoped cordon until its original event expires. A later
+		// out-of-scope observation must not extend the scoped numerator window.
+		if oldEvent.inCircuitBreakerScope && !inCircuitBreakerScope {
+			return
+		}
+
 		// Node was already cordoned in this window, remove from old bucket
-		if oldBucketNodes, ok := b.indexToNodes[oldIndex]; ok {
+		if oldBucketNodes, ok := b.indexToNodes[oldEvent.bucketIndex]; ok {
 			delete(oldBucketNodes, nodeName)
 
-			b.buckets[oldIndex]--
+			b.buckets[oldEvent.bucketIndex]--
 		}
 	}
 
 	slog.Debug("Adding node to current bucket",
 		"node", nodeName,
-		"bucket", currentBucketIndex)
+		"bucket", currentBucketIndex,
+		"inCircuitBreakerScope", eventInCircuitBreakerScope)
 	// Add node to current bucket
-	b.nodeToIndex[nodeName] = currentBucketIndex
+	b.nodeToEvent[nodeName] = cordonEvent{
+		bucketIndex:           currentBucketIndex,
+		inCircuitBreakerScope: eventInCircuitBreakerScope,
+	}
 	b.indexToNodes[currentBucketIndex][nodeName] = true
 	b.buckets[currentBucketIndex]++
 }
 
-// sumBucketsLocked calculates the total number of cordon events across all buckets
-// in the sliding window. This method must be called with the mutex locked.
-// Returns the sum of all bucket values representing recent cordon events.
-func (b *slidingWindowBreaker) sumBuckets() int {
-	sum := 0
+// countRecentScopedCordons counts unique recent cordon events that were in the
+// configured circuit breaker scope when they were recorded.
+func (b *slidingWindowBreaker) countRecentScopedCordons() int {
+	count := 0
 
-	for _, v := range b.buckets {
-		sum += v
+	for _, event := range b.nodeToEvent {
+		if event.inCircuitBreakerScope {
+			count++
+		}
 	}
 
-	return sum
+	return count
 }
 
 // IsTripped checks if the circuit breaker should prevent further node cordoning.
 // It returns true if:
 // 1. The breaker is already in TRIPPED state, OR
-// 2. Recent cordon events exceed the configured threshold (TripPercentage * total nodes)
+// 2. Recent scoped cordon events exceed the configured threshold (TripPercentage * scoped nodes)
 // The method automatically trips the breaker if the threshold is exceeded.
 func (b *slidingWindowBreaker) IsTripped(ctx context.Context) (bool, error) {
 	b.mu.RLock()
@@ -194,16 +215,24 @@ func (b *slidingWindowBreaker) IsTripped(ctx context.Context) (bool, error) {
 
 	b.mu.RUnlock()
 
-	totalNodes, err := b.getTotalNodesWithRetry(ctx)
+	circuitBreakerNodeNames, err := b.getCircuitBreakerNodeNamesWithRetry(ctx)
 	if err != nil {
-		slog.ErrorContext(ctx, "Failed to get total nodes after retries", "error", err)
+		if errors.Is(err, ErrEmptyCircuitBreakerScope) {
+			slog.WarnContext(ctx, "Circuit breaker node scope is empty", "error", err)
+			metrics.SetFaultQuarantineBreakerState(string(StateClosed))
+			metrics.SetFaultQuarantineBreakerUtilization(0)
+			return false, err
+		}
 
-		return false, fmt.Errorf("failed to get total nodes after retries: %w", err)
+		slog.ErrorContext(ctx, "Failed to get circuit breaker nodes", "error", err)
+
+		return false, fmt.Errorf("failed to get circuit breaker nodes: %w", err)
 	}
 
+	totalNodes := len(circuitBreakerNodeNames)
 	if totalNodes == 0 {
-		slog.ErrorContext(ctx, "Total nodes is still 0 after all retry attempts - cluster may have no GPU nodes")
-		return false, fmt.Errorf("total nodes is 0 after retries")
+		slog.WarnContext(ctx, "Circuit breaker node scope is empty")
+		return false, ErrEmptyCircuitBreakerScope
 	}
 
 	now := time.Now()
@@ -211,7 +240,7 @@ func (b *slidingWindowBreaker) IsTripped(ctx context.Context) (bool, error) {
 	b.mu.Lock()
 
 	b.slideWindow(now)
-	recentCordonedNodes := b.sumBuckets()
+	recentCordonedNodes := b.countRecentScopedCordons()
 	threshold := int(math.Ceil(float64(totalNodes) * b.cfg.TripPercentage / 100))
 	shouldTrip := recentCordonedNodes >= threshold
 
@@ -278,9 +307,9 @@ func (b *slidingWindowBreaker) SetCursorMode(ctx context.Context, mode CursorMod
 	return b.cfg.K8sClient.WriteCursorMode(ctx, b.cfg.ConfigMapName, b.cfg.ConfigMapNamespace, mode)
 }
 
-// getTotalNodesWithRetry gets the total number of nodes with retry logic and exponential backoff.
-// This handles NodeInformer cache sync delays that can cause GetTotalNodes to temporarily return 0.
-func (b *slidingWindowBreaker) getTotalNodesWithRetry(ctx context.Context) (int, error) {
+// getCircuitBreakerNodeNamesWithRetry gets the circuit breaker node set.
+// An empty synced scope is a stable fail-closed condition, not a retry-exhaustion restart signal.
+func (b *slidingWindowBreaker) getCircuitBreakerNodeNamesWithRetry(ctx context.Context) (map[string]bool, error) {
 	startTime := time.Now()
 
 	var result string
@@ -299,42 +328,43 @@ func (b *slidingWindowBreaker) getTotalNodesWithRetry(ctx context.Context) (int,
 	maxRetries, initialDelay, maxDelay := b.getRetryConfig()
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		totalNodes, err := b.cfg.K8sClient.GetTotalNodes(ctx)
+		nodeNames, err := b.cfg.K8sClient.GetCircuitBreakerNodeNames(ctx)
 		if err != nil {
 			result = resultError
 			errorType = "api_error"
 
-			return b.handleGetTotalNodesError(err, attempt, maxRetries)
-		}
-
-		if totalNodes > 0 {
-			result = "success"
-
-			metrics.FaultQuarantineGetTotalNodesRetryAttempts.Observe(float64(attempt))
-
-			return b.handleSuccessfulNodeCount(totalNodes, attempt)
-		}
-
-		if attempt == 0 {
-			slog.InfoContext(ctx, "Circuit breaker starting retries: NodeInformer cache may not be synced yet",
-				"maxRetries", maxRetries)
-		}
-
-		if attempt < maxRetries {
-			if err := b.performRetryDelay(ctx, attempt, maxRetries, initialDelay, maxDelay); err != nil {
-				result = resultError
-				errorType = "context_cancelled"
-
-				return 0, fmt.Errorf("context cancelled during GetTotalNodes retry: %w", err)
+			wrappedErr := b.handleGetCircuitBreakerNodeNamesError(err, attempt, maxRetries)
+			if attempt == maxRetries {
+				return nil, fmt.Errorf("%w: GetCircuitBreakerNodeNames failed after %d attempts: %w",
+					ErrRetryExhausted, attempt+1, wrappedErr)
 			}
+
+			if err := b.performRetryDelay(ctx, attempt, maxRetries, initialDelay, maxDelay); err != nil {
+				errorType = "context_cancelled"
+				return nil, fmt.Errorf("context cancelled during circuit breaker node retry: %w", err)
+			}
+
+			continue
 		}
+
+		if len(nodeNames) == 0 {
+			result = resultError
+			errorType = "empty_scope"
+
+			slog.WarnContext(ctx, "Circuit breaker node scope is empty; blocking quarantine until at least one scoped node is visible")
+
+			return nil, ErrEmptyCircuitBreakerScope
+		}
+
+		result = "success"
+		errorType = ""
+		metrics.FaultQuarantineGetTotalNodesRetryAttempts.Observe(float64(attempt))
+
+		return b.handleSuccessfulCircuitBreakerNodeNames(nodeNames, attempt)
 	}
 
-	// All retries exhausted
 	result = resultError
-	errorType = "zero_nodes"
-
-	return 0, b.logRetriesExhausted(ctx, maxRetries, initialDelay, maxDelay)
+	return nil, fmt.Errorf("%w: circuit breaker node retry loop exited unexpectedly", ErrRetryExhausted)
 }
 
 // getRetryConfig extracts and validates retry configuration with defaults
@@ -357,25 +387,28 @@ func (b *slidingWindowBreaker) getRetryConfig() (int, time.Duration, time.Durati
 	return maxRetries, initialDelay, maxDelay
 }
 
-// handleGetTotalNodesError handles API errors from GetTotalNodes
-func (b *slidingWindowBreaker) handleGetTotalNodesError(err error, attempt, maxRetries int) (int, error) {
-	slog.Error("GetTotalNodes failed on attempt",
+// handleGetCircuitBreakerNodeNamesError handles API errors from GetCircuitBreakerNodeNames.
+func (b *slidingWindowBreaker) handleGetCircuitBreakerNodeNamesError(err error, attempt, maxRetries int) error {
+	slog.Error("GetCircuitBreakerNodeNames failed on attempt",
 		"attempt", attempt+1,
 		"maxAttempts", maxRetries+1,
 		"error", err)
 
-	return 0, fmt.Errorf("GetTotalNodes failed: %w", err)
+	return fmt.Errorf("GetCircuitBreakerNodeNames failed: %w", err)
 }
 
-// handleSuccessfulNodeCount handles the success case when nodes > 0
-func (b *slidingWindowBreaker) handleSuccessfulNodeCount(totalNodes, attempt int) (int, error) {
+// handleSuccessfulCircuitBreakerNodeNames handles the success case when nodes > 0.
+func (b *slidingWindowBreaker) handleSuccessfulCircuitBreakerNodeNames(
+	nodeNames map[string]bool,
+	attempt int,
+) (map[string]bool, error) {
 	if attempt > 0 {
 		slog.Info("Circuit breaker retry successful",
-			"totalNodes", totalNodes,
+			"circuitBreakerNodes", len(nodeNames),
 			"attempts", attempt+1)
 	}
 
-	return totalNodes, nil
+	return nodeNames, nil
 }
 
 // performRetryDelay calculates and performs the exponential backoff delay
@@ -383,7 +416,7 @@ func (b *slidingWindowBreaker) performRetryDelay(ctx context.Context, attempt, m
 	initialDelay, maxDelay time.Duration) error {
 	delay := b.calculateBackoffDelay(attempt, initialDelay, maxDelay)
 
-	slog.DebugContext(ctx, "Circuit breaker retry; got 0 nodes, retrying (NodeInformer cache may still be syncing)",
+	slog.DebugContext(ctx, "Circuit breaker retry; got 0 circuit breaker nodes, retrying (NodeInformer cache may still be syncing)",
 		"attempt", attempt+1,
 		"maxRetries", maxRetries,
 		"delay", delay)
@@ -414,33 +447,4 @@ func (b *slidingWindowBreaker) calculateBackoffDelay(attempt int,
 	}
 
 	return delay
-}
-
-// logRetriesExhausted logs a summary when all retries are exhausted.
-// Returns ErrRetryExhausted wrapped with context for pod restart.
-func (b *slidingWindowBreaker) logRetriesExhausted(ctx context.Context, maxRetries int,
-	initialDelay, maxDelay time.Duration) error {
-	actualNodes, err := b.cfg.K8sClient.GetTotalNodes(ctx)
-	if err != nil {
-		slog.ErrorContext(ctx,
-			"Circuit breaker: All retry attempts exhausted; failed to get node count from Kubernetes API; pod will restart",
-			"maxRetries", maxRetries,
-			"error", err,
-			"initialDelay", initialDelay,
-			"totalClusterNodes", actualNodes,
-			"maxDelay", maxDelay)
-
-		return fmt.Errorf("%w: failed to get node count: %w", ErrRetryExhausted, err)
-	}
-
-	slog.ErrorContext(ctx, "Circuit breaker: All retry attempts exhausted",
-		"maxRetries", maxRetries,
-		"actualNodes", actualNodes,
-		"initialDelay", initialDelay,
-		"maxDelay", maxDelay,
-		"message",
-		"Found total nodes but GetTotalNodes still returning 0. NodeInformer cache sync issues. Pod will restart.")
-
-	return fmt.Errorf("%w: NodeInformer cache sync failed after %d retries (actualNodes=%d but GetTotalNodes returning 0)",
-		ErrRetryExhausted, maxRetries, actualNodes)
 }

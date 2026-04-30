@@ -67,8 +67,9 @@ fault-quarantine:
   
   circuitBreaker:
     enabled: true        # Safety feature to prevent mass cordoning
-    percentage: 50       # Max % of nodes that can be cordoned
+    percentage: 50       # Max % of scoped nodes that can be cordoned
     duration: "5m"       # Time window for percentage calculation
+    scope: "all"         # Count all Kubernetes nodes by default
   
   labelPrefix: "k8saas.nvidia.com/"  # Prefix for node labels and annotations
   

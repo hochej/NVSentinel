@@ -426,16 +426,16 @@ fault-quarantine:
   circuitBreaker:
     # Enable circuit breaker protection
     enabled: true
-    # Maximum percentage of cluster nodes that can be cordoned
-    # Example: 50 means if 50% or more nodes are already cordoned,
+    # Maximum percentage of scoped nodes that can be cordoned
+    # Example: 50 means if 50% or more scoped nodes are cordoned within the window,
     # no new quarantines will be allowed
     # Range: 1-100
     percentage: 50
-    # Cooldown period after circuit breaker trips
-    # Circuit breaker waits this long before attempting to close again
-    # Even if node count drops below threshold during cooldown, it stays open
+    # Sliding time window for cordon events
     # Examples: "5m", "10m", "1h"
     duration: "5m"
+    # Node scope used for both numerator and denominator: all or gpu
+    scope: "all"
 
   # Quarantine rules define when and how to quarantine nodes
   # Each rule has:

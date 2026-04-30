@@ -14,6 +14,15 @@
 
 package config
 
+import "strings"
+
+const (
+	// CircuitBreakerScopeGPU limits circuit breaker calculations to GPU nodes.
+	CircuitBreakerScopeGPU = "gpu"
+	// CircuitBreakerScopeAll uses all Kubernetes nodes for circuit breaker calculations.
+	CircuitBreakerScopeAll = "all"
+)
+
 type Rule struct {
 	Kind       string `toml:"kind"`
 	Expression string `toml:"expression"`
@@ -32,6 +41,18 @@ type Cordon struct {
 type CircuitBreaker struct {
 	Percentage int    `toml:"percentage"`
 	Duration   string `toml:"duration"`
+	Scope      string `toml:"scope"`
+}
+
+// EffectiveScope returns the configured circuit breaker node scope.
+// Empty scope defaults to all nodes, preserving the pre-scope circuit breaker behavior.
+func (cb CircuitBreaker) EffectiveScope() string {
+	scope := strings.ToLower(strings.TrimSpace(cb.Scope))
+	if scope == "" {
+		return CircuitBreakerScopeAll
+	}
+
+	return scope
 }
 
 type Match struct {

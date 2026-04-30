@@ -177,11 +177,18 @@ func initializeCircuitBreaker(
 		return nil, fmt.Errorf("invalid circuit breaker duration %q: %w", cbConfig.Duration, err)
 	}
 
+	if err := validateCircuitBreakerConfig(cbConfig); err != nil {
+		return nil, err
+	}
+
+	k8sClient.SetCircuitBreakerConfig(cbConfig)
+
 	slog.InfoContext(ctx, "Initializing circuit breaker",
 		"configMap", circuitBreakerName,
 		"namespace", namespace,
 		"percentage", cbConfig.Percentage,
-		"duration", cbConfig.Duration)
+		"duration", cbConfig.Duration,
+		"scope", cbConfig.EffectiveScope())
 
 	cb, err := breaker.NewSlidingWindowBreaker(ctx, breaker.Config{
 		Window:             duration,
@@ -195,4 +202,17 @@ func initializeCircuitBreaker(
 	}
 
 	return cb, nil
+}
+
+func validateCircuitBreakerConfig(cbConfig config.CircuitBreaker) error {
+	scope := cbConfig.EffectiveScope()
+	switch scope {
+	case config.CircuitBreakerScopeGPU, config.CircuitBreakerScopeAll:
+		return nil
+	default:
+		return fmt.Errorf("invalid circuit breaker scope %q: must be one of %q or %q",
+			cbConfig.Scope,
+			config.CircuitBreakerScopeGPU,
+			config.CircuitBreakerScopeAll)
+	}
 }

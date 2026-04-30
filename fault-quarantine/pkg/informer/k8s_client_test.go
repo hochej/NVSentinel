@@ -22,6 +22,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -132,6 +133,68 @@ func createTestNode(ctx context.Context, t *testing.T, name string, annotations 
 	_, err := testClient.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("Failed to create test node %s: %v", name, err)
+	}
+}
+
+func TestCircuitBreakerDefaultAllScopeCountsAllNodes(t *testing.T) {
+	ctx := context.Background()
+	gpuNode1 := testutils.GenerateTestNodeName("cb-gpu")
+	gpuNode2 := testutils.GenerateTestNodeName("cb-gpu")
+	cpuNode := testutils.GenerateTestNodeName("cb-cpu")
+	nodeNames := []string{gpuNode1, gpuNode2, cpuNode}
+
+	createTestNode(ctx, t, gpuNode1, nil, map[string]string{"nvidia.com/gpu.present": "true"}, nil, false)
+	createTestNode(ctx, t, gpuNode2, nil, map[string]string{"feature.node.kubernetes.io/pci-10de.present": "true"}, nil, false)
+	createTestNode(ctx, t, cpuNode, nil, nil, nil, false)
+	defer deleteTestNodes(ctx, nodeNames)
+
+	k8sClient := setupTestClient(t)
+	nodeNamesMap, err := k8sClient.GetCircuitBreakerNodeNames(ctx)
+	if err != nil {
+		t.Fatalf("GetCircuitBreakerNodeNames failed: %v", err)
+	}
+
+	if len(nodeNamesMap) != 3 || !nodeNamesMap[gpuNode1] || !nodeNamesMap[gpuNode2] || !nodeNamesMap[cpuNode] {
+		t.Fatalf("expected all nodes in default circuit breaker scope, got %#v", nodeNamesMap)
+	}
+}
+
+func TestCircuitBreakerGPUScopeDetectsCapacity(t *testing.T) {
+	ctx := context.Background()
+	gpuNodeName := testutils.GenerateTestNodeName("cb-gpu-capacity")
+	cpuNodeName := testutils.GenerateTestNodeName("cb-cpu-capacity")
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: gpuNodeName},
+		Status: v1.NodeStatus{
+			Capacity: v1.ResourceList{
+				v1.ResourceName("nvidia.com/gpu"): resource.MustParse("1"),
+			},
+			Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}},
+		},
+	}
+
+	_, err := testClient.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create test node %s: %v", gpuNodeName, err)
+	}
+	createTestNode(ctx, t, cpuNodeName, nil, nil, nil, false)
+	defer deleteTestNodes(ctx, []string{gpuNodeName, cpuNodeName})
+
+	k8sClient := setupTestClient(t)
+	k8sClient.SetCircuitBreakerConfig(config.CircuitBreaker{Scope: config.CircuitBreakerScopeGPU})
+	nodeNamesMap, err := k8sClient.GetCircuitBreakerNodeNames(ctx)
+	if err != nil {
+		t.Fatalf("GetCircuitBreakerNodeNames failed: %v", err)
+	}
+
+	if len(nodeNamesMap) != 1 || !nodeNamesMap[gpuNodeName] {
+		t.Fatalf("expected only GPU capacity node in GPU circuit breaker scope, got %#v", nodeNamesMap)
+	}
+}
+
+func deleteTestNodes(ctx context.Context, nodeNames []string) {
+	for _, nodeName := range nodeNames {
+		_ = testClient.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{})
 	}
 }
 

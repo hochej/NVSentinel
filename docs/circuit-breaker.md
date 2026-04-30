@@ -44,16 +44,19 @@ Configure the circuit breaker through your Helm values:
 ```yaml
 fault-quarantine:
   circuitBreaker:
-    enabled: true      # Enable or disable the protection
-    percentage: 50     # Percentage of nodes that can be cordoned
-    duration: "5m"     # Time window to monitor
+    enabled: true       # Enable or disable the protection
+    percentage: 50      # Percentage of scoped nodes that can be cordoned
+    duration: "5m"      # Time window to monitor
+    scope: "all"        # all or gpu
 ```
 
-**Example:** With `percentage: 50` and `duration: "5m"`, if 50% or more of your cluster nodes are cordoned within any 5-minute period, the circuit breaker will trip.
+**Example:** With `percentage: 50`, `duration: "5m"`, and the default `scope: "all"`, if 50% or more of your Kubernetes nodes are cordoned within any 5-minute period, the circuit breaker will trip.
+
+For deployments whose quarantine rules only target GPU nodes, set `scope: "gpu"` to calculate the breaker against GPU nodes only. In mixed GPU/CPU clusters, CPU-only cordon events are recorded but excluded from the breaker calculation when GPU scope is selected. If the selected scope is empty, quarantine processing fails closed until at least one scoped node is visible.
 
 **Recommended Settings:**
-- For production clusters with 10+ nodes: Keep enabled with 50% threshold
-- For small clusters (< 10 nodes): Consider disabling or using a higher percentage
+- For production scopes with 10+ nodes: Keep enabled with 50% threshold
+- For small scopes (< 10 nodes): Consider disabling or using a higher percentage
 
 ## Monitoring the Circuit Breaker
 
@@ -89,7 +92,7 @@ NVSentinel exposes metrics for monitoring and alerting:
 # Current circuit breaker state (1 = TRIPPED, 0 = CLOSED)
 fault_quarantine_breaker_state{state="TRIPPED"}
 
-# Percentage of cluster currently cordoned (useful for dashboards)
+# Fraction of scoped circuit-breaker nodes recently cordoned (useful for dashboards)
 fault_quarantine_breaker_utilization
 ```
 

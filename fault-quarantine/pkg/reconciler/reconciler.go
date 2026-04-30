@@ -368,6 +368,11 @@ func (r *Reconciler) checkCircuitBreakerAtStartup(ctx context.Context) error {
 			return err
 		}
 
+		if errors.Is(err, breaker.ErrEmptyCircuitBreakerScope) {
+			slog.WarnContext(ctx, "Circuit breaker scope is empty at startup; startup will continue but quarantine processing is blocked until scoped nodes are visible", "error", err)
+			return nil
+		}
+
 		slog.ErrorContext(ctx, "Error checking if circuit breaker is tripped", "error", err)
 		<-ctx.Done()
 
@@ -487,6 +492,55 @@ func (r *Reconciler) checkCircuitBreakerAndHalt(ctx context.Context) bool {
 
 	tripped, err := r.cb.IsTripped(ctx)
 	if err != nil {
+		if errors.Is(err, breaker.ErrEmptyCircuitBreakerScope) {
+			slog.WarnContext(ctx, "Circuit breaker scope is empty; pausing quarantine processing until scoped nodes are visible", "error", err)
+			tracing.RecordError(span, err)
+			span.SetAttributes(
+				attribute.String("fault_quarantine.error.type", "empty_circuit_breaker_scope"),
+				attribute.String("fault_quarantine.error.message", err.Error()),
+			)
+
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return true
+				case <-ticker.C:
+					tripped, err = r.cb.IsTripped(ctx)
+					if errors.Is(err, breaker.ErrEmptyCircuitBreakerScope) {
+						slog.WarnContext(ctx, "Circuit breaker scope is still empty; quarantine processing remains paused", "error", err)
+						continue
+					}
+					if err != nil {
+						slog.ErrorContext(ctx, "Error checking if circuit breaker is tripped", "error", err)
+						tracing.RecordError(span, err)
+						span.SetAttributes(
+							attribute.String("fault_quarantine.error.type", "check_circuit_breaker_state_error"),
+							attribute.String("fault_quarantine.error.message", err.Error()),
+						)
+						<-ctx.Done()
+
+						return true
+					}
+					if tripped {
+						slog.ErrorContext(ctx, "Circuit breaker TRIPPED. Halting event processing until restart and breaker reset.")
+						span.SetAttributes(
+							attribute.String("fault_quarantine.circuit_breaker.state", "tripped"),
+							attribute.Bool("fault_quarantine.circuit_breaker.tripped", true),
+						)
+						<-ctx.Done()
+
+						return true
+					}
+
+					slog.InfoContext(ctx, "Circuit breaker scope is no longer empty; resuming quarantine processing")
+					return false
+				}
+			}
+		}
+
 		slog.ErrorContext(ctx, "Error checking if circuit breaker is tripped", "error", err)
 		tracing.RecordError(span, err)
 		span.SetAttributes(
@@ -894,7 +948,17 @@ func (r *Reconciler) applyQuarantine(
 	ctx, span := tracing.StartSpan(ctx, "fault_quarantine.apply_quarantine")
 	defer span.End()
 
-	r.recordCordonEventInCircuitBreaker(event)
+	if err := r.recordCordonEventInCircuitBreaker(ctx, event); err != nil {
+		slog.ErrorContext(ctx, "Failed to record cordon event in circuit breaker", "node", event.HealthEvent.NodeName, "error", err)
+		tracing.RecordError(span, err)
+		span.SetAttributes(
+			attribute.String("fault_quarantine.error.type", "record_circuit_breaker_cordon_event_error"),
+			attribute.String("fault_quarantine.error.message", err.Error()),
+		)
+		<-ctx.Done()
+
+		return nil
+	}
 
 	healthEvents := healthEventsAnnotation.NewHealthEventsAnnotationMap()
 	updated := healthEvents.AddOrUpdateEvent(event.HealthEvent)
@@ -988,12 +1052,26 @@ func syncMapToStringMap(m *sync.Map) map[string]string {
 	return result
 }
 
-// recordCordonEventInCircuitBreaker records a cordon event in the circuit breaker if enabled
-func (r *Reconciler) recordCordonEventInCircuitBreaker(event *model.HealthEventWithStatus) {
-	if r.config.CircuitBreakerEnabled &&
-		(event.HealthEvent.QuarantineOverrides == nil || !event.HealthEvent.QuarantineOverrides.Force) {
-		r.cb.AddCordonEvent(event.HealthEvent.NodeName)
+// recordCordonEventInCircuitBreaker records a cordon event in the circuit breaker if enabled.
+func (r *Reconciler) recordCordonEventInCircuitBreaker(ctx context.Context, event *model.HealthEventWithStatus) error {
+	if !r.config.CircuitBreakerEnabled ||
+		(event.HealthEvent.QuarantineOverrides != nil && event.HealthEvent.QuarantineOverrides.Force) {
+		return nil
 	}
+
+	nodeName := event.HealthEvent.NodeName
+	nodeNames, err := r.k8sClient.GetCircuitBreakerNodeNames(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get circuit breaker node names before recording cordon event: %w", err)
+	}
+	if len(nodeNames) == 0 {
+		return fmt.Errorf("%w: no circuit breaker nodes visible before recording cordon event", breaker.ErrEmptyCircuitBreakerScope)
+	}
+
+	inCircuitBreakerScope := nodeNames[nodeName]
+	r.cb.AddCordonEvent(nodeName, inCircuitBreakerScope)
+
+	return nil
 }
 
 // addHealthEventAnnotation adds health event annotation to the annotations map

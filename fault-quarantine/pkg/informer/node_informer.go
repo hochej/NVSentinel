@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -171,6 +172,66 @@ func (ni *NodeInformer) GetNodeCounts() (totalNodes int, quarantinedNodesMap map
 	}
 
 	return total, quarantinedMap, nil
+}
+
+// GetCircuitBreakerNodeNames returns the set of node names that should be used
+// by circuit breaker numerator and denominator calculations.
+func (ni *NodeInformer) GetCircuitBreakerNodeNames(
+	cbConfig config.CircuitBreaker,
+) (map[string]bool, error) {
+	if !ni.HasSynced() {
+		return nil, fmt.Errorf("node informer cache not synced yet")
+	}
+
+	allObjs := ni.informer.GetIndexer().List()
+	nodeNames := make(map[string]bool, len(allObjs))
+	scope := cbConfig.EffectiveScope()
+
+	for _, obj := range allObjs {
+		node, ok := obj.(*v1.Node)
+		if !ok {
+			continue
+		}
+
+		if nodeMatchesCircuitBreakerScope(node, scope) {
+			nodeNames[node.Name] = true
+		}
+	}
+
+	return nodeNames, nil
+}
+
+func nodeMatchesCircuitBreakerScope(node *v1.Node, scope string) bool {
+	switch scope {
+	case config.CircuitBreakerScopeAll:
+		return true
+	case config.CircuitBreakerScopeGPU:
+		return isGPUNode(node)
+	default:
+		return false
+	}
+}
+
+func isGPUNode(node *v1.Node) bool {
+	if hasTrueLabel(node.Labels, "nvidia.com/gpu.present") ||
+		hasTrueLabel(node.Labels, "feature.node.kubernetes.io/pci-10de.present") {
+		return true
+	}
+
+	if quantity, ok := node.Status.Capacity[v1.ResourceName("nvidia.com/gpu")]; ok && quantity.Sign() > 0 {
+		return true
+	}
+
+	if quantity, ok := node.Status.Allocatable[v1.ResourceName("nvidia.com/gpu")]; ok && quantity.Sign() > 0 {
+		return true
+	}
+
+	return false
+}
+
+func hasTrueLabel(labels map[string]string, key string) bool {
+	value, ok := labels[key]
+	return ok && strings.EqualFold(value, "true")
 }
 
 // GetNode retrieves a node from the informer's cache.

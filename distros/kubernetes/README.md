@@ -145,8 +145,9 @@ fault-quarantine:
   # Circuit breaker to prevent mass quarantines
   circuitBreaker:
     enabled: true
-    percentage: 50    # Max % of nodes to quarantine
-    duration: "5m"    # Cooldown period
+    percentage: 50    # Max % of scoped nodes to quarantine
+    duration: "5m"    # Sliding time window
+    scope: "all"      # all or gpu
 
   # Quarantine rules
   ruleSets:

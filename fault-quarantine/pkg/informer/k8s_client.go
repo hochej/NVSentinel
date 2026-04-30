@@ -47,6 +47,7 @@ type FaultQuarantineClient struct {
 	Clientset                kubernetes.Interface
 	DryRunMode               bool
 	NodeInformer             *NodeInformer
+	CircuitBreakerConfig     config.CircuitBreaker
 	cordonedReasonLabelKey   string
 	uncordonedReasonLabelKey string
 	operationMutex           sync.Map // map[string]*sync.Mutex for per-node locking
@@ -128,6 +129,26 @@ func (c *FaultQuarantineClient) GetTotalNodes(ctx context.Context) (int, error) 
 	slog.DebugContext(ctx, "Got total nodes from NodeInformer cache", "totalNodes", totalNodes)
 
 	return totalNodes, nil
+}
+
+// SetCircuitBreakerConfig sets the node scope used by circuit breaker calculations.
+func (c *FaultQuarantineClient) SetCircuitBreakerConfig(cbConfig config.CircuitBreaker) {
+	c.CircuitBreakerConfig = cbConfig
+}
+
+// GetCircuitBreakerNodeNames returns the circuit breaker node set after applying
+// the configured scope.
+func (c *FaultQuarantineClient) GetCircuitBreakerNodeNames(ctx context.Context) (map[string]bool, error) {
+	nodeNames, err := c.NodeInformer.GetCircuitBreakerNodeNames(c.CircuitBreakerConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get circuit breaker node names from informer: %w", err)
+	}
+
+	slog.DebugContext(ctx, "Got circuit breaker nodes from NodeInformer cache",
+		"nodes", len(nodeNames),
+		"scope", c.CircuitBreakerConfig.EffectiveScope())
+
+	return nodeNames, nil
 }
 
 func (c *FaultQuarantineClient) SetLabelKeys(cordonedReasonKey, uncordonedReasonKey string) {

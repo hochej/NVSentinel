@@ -53,13 +53,19 @@ labelPrefix: "k8saas.nvidia.com/"
 circuitBreaker:
   # Enable/disable circuit breaker protection (passed as command-line arg to the deployment)
   enabled: true
-  # Maximum percentage of cluster nodes that can be quarantined before circuit breaker trips
+  # Maximum percentage of scoped nodes that can be quarantined before circuit breaker trips
   # Example: 50 means if 50% or more nodes are cordoned, no new quarantines will be allowed
   percentage: 50
   # Time window for the sliding window circuit breaker
   # The circuit breaker counts cordon events within this time window
   # Example: "5m" means if 50% of nodes are cordoned within any 5-minute window, the circuit breaker trips
   duration: "5m"
+  # Node scope used for both the circuit breaker numerator and denominator.
+  # Supported values:
+  # - all: count all Kubernetes nodes (default, pre-scoping behavior).
+  # - gpu: count GPU nodes only. GPU nodes are detected from nvidia.com/gpu capacity/allocatable
+  #        or common GPU labels such as nvidia.com/gpu.present=true.
+  scope: "all"
 
 # Rule sets for node quarantine actions
 # Each ruleset defines conditions (match) and actions (taint, cordon) to apply when conditions are met

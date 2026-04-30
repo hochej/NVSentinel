@@ -17,6 +17,7 @@ package breaker
 import (
 	"context"
 	"crypto/rand"
+	stderrors "errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -79,9 +80,10 @@ func TestMain(m *testing.M) {
 }
 
 type testK8sClient struct {
-	clientset      kubernetes.Interface
-	informer       cache.SharedIndexInformer
-	informerSynced cache.InformerSynced
+	clientset               kubernetes.Interface
+	informer                cache.SharedIndexInformer
+	informerSynced          cache.InformerSynced
+	circuitBreakerNodeNames map[string]bool
 }
 
 func (c *testK8sClient) GetTotalNodes(ctx context.Context) (int, error) {
@@ -91,6 +93,32 @@ func (c *testK8sClient) GetTotalNodes(ctx context.Context) (int, error) {
 
 	allObjs := c.informer.GetIndexer().List()
 	return len(allObjs), nil
+}
+
+func (c *testK8sClient) GetCircuitBreakerNodeNames(ctx context.Context) (map[string]bool, error) {
+	if c.circuitBreakerNodeNames != nil {
+		nodeNames := make(map[string]bool, len(c.circuitBreakerNodeNames))
+		for nodeName := range c.circuitBreakerNodeNames {
+			nodeNames[nodeName] = true
+		}
+
+		return nodeNames, nil
+	}
+
+	if !c.informerSynced() {
+		return nil, fmt.Errorf("node informer cache not synced yet")
+	}
+
+	allObjs := c.informer.GetIndexer().List()
+	nodeNames := make(map[string]bool, len(allObjs))
+
+	for _, obj := range allObjs {
+		if node, ok := obj.(*corev1.Node); ok {
+			nodeNames[node.Name] = true
+		}
+	}
+
+	return nodeNames, nil
 }
 
 func (c *testK8sClient) EnsureCircuitBreakerConfigMap(ctx context.Context, name, namespace string, initialStatus State) error {
@@ -234,11 +262,13 @@ func newTestBreaker(t *testing.T, ctx context.Context, totalNodes int, tripPerce
 
 	k8sClient := setupTestClient(t)
 
-	// Create the specified number of nodes
+	// Create the specified number of nodes with stable names so cordon events
+	// can be matched against the scoped circuit breaker node set.
 	nodeNames := make([]string, totalNodes)
 	for i := 0; i < totalNodes; i++ {
-		nodeName := fmt.Sprintf("test-node-%d-%s", i, generateTestID()[:6])
+		nodeName := fmt.Sprintf("node%d", i)
 		nodeNames[i] = nodeName
+		_ = testClient.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{})
 		createTestNode(ctx, t, nodeName)
 	}
 
@@ -290,7 +320,7 @@ func TestDoesNotTripBelowThreshold(t *testing.T) {
 
 	t.Log("Adding 3 cordon events (below threshold of 5)")
 	for i := 0; i < 3; i++ {
-		b.AddCordonEvent(fmt.Sprintf("node%d", i))
+		b.AddCordonEvent(fmt.Sprintf("node%d", i), true)
 	}
 	tripped, err := b.IsTripped(ctx)
 	if err != nil {
@@ -315,7 +345,7 @@ func TestTripsWhenAboveThreshold(t *testing.T) {
 
 	t.Log("Adding 5 cordon events (at threshold, should trip)")
 	for i := 0; i < 5; i++ {
-		b.AddCordonEvent(fmt.Sprintf("node%d", i))
+		b.AddCordonEvent(fmt.Sprintf("node%d", i), true)
 	}
 	tripped, err := b.IsTripped(ctx)
 	if err != nil {
@@ -372,7 +402,7 @@ func TestWindowExpiryResetsCounts(t *testing.T) {
 
 	t.Log("Adding 6 cordon events (exceeds threshold)")
 	for i := 0; i < 6; i++ {
-		b.AddCordonEvent(fmt.Sprintf("node%d", i))
+		b.AddCordonEvent(fmt.Sprintf("node%d", i), true)
 	}
 	tripped, err := b.IsTripped(ctx)
 	if err != nil {
@@ -423,7 +453,7 @@ func TestFlappingNodeDoesNotMultiplyCount(t *testing.T) {
 
 	t.Log("Add the same node 10 times (simulating flapping)")
 	for range 10 {
-		b.AddCordonEvent("flapping-node")
+		b.AddCordonEvent("node0", true)
 	}
 
 	t.Log("Verify breaker does not trip for single flapping node")
@@ -436,8 +466,8 @@ func TestFlappingNodeDoesNotMultiplyCount(t *testing.T) {
 	}
 
 	t.Log("Add 4 more unique nodes (total 5 unique nodes)")
-	for i := 0; i < 4; i++ {
-		b.AddCordonEvent(fmt.Sprintf("node%d", i))
+	for i := 1; i < 5; i++ {
+		b.AddCordonEvent(fmt.Sprintf("node%d", i), true)
 	}
 
 	// Now should trip because we have 5 unique nodes (at threshold, >= 5)
@@ -448,6 +478,139 @@ func TestFlappingNodeDoesNotMultiplyCount(t *testing.T) {
 	if !tripped {
 		t.Fatalf("breaker should trip with 5 unique nodes (5 >= 5 threshold)")
 	}
+}
+
+func TestScopedNodeSetFiltersNumerator(t *testing.T) {
+	ctx := context.Background()
+	k8sClient := setupTestClient(t)
+	k8sClient.circuitBreakerNodeNames = map[string]bool{
+		"gpu0": true,
+		"gpu1": true,
+	}
+
+	configMapName := "test-breaker-" + generateTestID()[:8]
+	b, err := NewSlidingWindowBreaker(ctx, Config{
+		Window:             5 * time.Second,
+		TripPercentage:     100,
+		K8sClient:          k8sClient,
+		ConfigMapName:      configMapName,
+		ConfigMapNamespace: "default",
+	})
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_ = testClient.CoreV1().ConfigMaps("default").Delete(context.Background(), configMapName, metav1.DeleteOptions{})
+	})
+
+	b.AddCordonEvent("cpu0", false)
+	b.AddCordonEvent("gpu0", true)
+
+	tripped, err := b.IsTripped(ctx)
+	require.NoError(t, err)
+	assert.False(t, tripped, "CPU node cordon event should not count against GPU-scoped threshold")
+
+	b.AddCordonEvent("gpu1", true)
+
+	tripped, err = b.IsTripped(ctx)
+	require.NoError(t, err)
+	assert.True(t, tripped, "both scoped GPU nodes cordoned should trip at 100% threshold")
+}
+
+func TestEmptyCircuitBreakerScopeFailsClosedWithoutTripping(t *testing.T) {
+	ctx := context.Background()
+	k8sClient := setupTestClient(t)
+	k8sClient.circuitBreakerNodeNames = map[string]bool{}
+
+	configMapName := "test-breaker-" + generateTestID()[:8]
+	b, err := NewSlidingWindowBreaker(ctx, Config{
+		Window:             5 * time.Second,
+		TripPercentage:     50,
+		K8sClient:          k8sClient,
+		ConfigMapName:      configMapName,
+		ConfigMapNamespace: "default",
+	})
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_ = testClient.CoreV1().ConfigMaps("default").Delete(context.Background(), configMapName, metav1.DeleteOptions{})
+	})
+
+	b.AddCordonEvent("gpu0", true)
+
+	tripped, err := b.IsTripped(ctx)
+	require.Error(t, err)
+	assert.True(t, stderrors.Is(err, ErrEmptyCircuitBreakerScope))
+	assert.False(t, tripped)
+	assert.Equal(t, StateClosed, b.CurrentState())
+}
+
+func TestScopedCordonEventRemainsCountedAfterNodeLeavesScope(t *testing.T) {
+	ctx := context.Background()
+	k8sClient := setupTestClient(t)
+	k8sClient.circuitBreakerNodeNames = map[string]bool{
+		"gpu0": true,
+		"gpu1": true,
+	}
+
+	configMapName := "test-breaker-" + generateTestID()[:8]
+	b, err := NewSlidingWindowBreaker(ctx, Config{
+		Window:             5 * time.Second,
+		TripPercentage:     50,
+		K8sClient:          k8sClient,
+		ConfigMapName:      configMapName,
+		ConfigMapNamespace: "default",
+	})
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_ = testClient.CoreV1().ConfigMaps("default").Delete(context.Background(), configMapName, metav1.DeleteOptions{})
+	})
+
+	b.AddCordonEvent("gpu0", true)
+	b.AddCordonEvent("gpu0", false)
+	k8sClient.circuitBreakerNodeNames = map[string]bool{
+		"gpu1": true,
+		"gpu2": true,
+	}
+
+	tripped, err := b.IsTripped(ctx)
+	require.NoError(t, err)
+	assert.True(t, tripped, "scoped cordon events should remain counted for the full window")
+}
+
+func TestOutOfScopeRepeatDoesNotExtendScopedCordonWindow(t *testing.T) {
+	ctx := context.Background()
+	k8sClient := setupTestClient(t)
+
+	configMapName := "test-breaker-" + generateTestID()[:8]
+	b, err := NewSlidingWindowBreaker(ctx, Config{
+		Window:             5 * time.Second,
+		TripPercentage:     50,
+		K8sClient:          k8sClient,
+		ConfigMapName:      configMapName,
+		ConfigMapNamespace: "default",
+	})
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_ = testClient.CoreV1().ConfigMaps("default").Delete(context.Background(), configMapName, metav1.DeleteOptions{})
+	})
+
+	b.AddCordonEvent("gpu0", true)
+	sb := b.(*slidingWindowBreaker)
+
+	sb.mu.Lock()
+	originalBucketIndex := sb.nodeToEvent["gpu0"].bucketIndex
+	sb.startTime = sb.startTime.Add(-time.Second)
+	sb.mu.Unlock()
+
+	b.AddCordonEvent("gpu0", false)
+
+	sb.mu.RLock()
+	defer sb.mu.RUnlock()
+	event := sb.nodeToEvent["gpu0"]
+	assert.True(t, event.inCircuitBreakerScope)
+	assert.Less(t, event.bucketIndex, originalBucketIndex, "out-of-scope repeats should not refresh the scoped event bucket")
 }
 
 // Helper functions for reading Prometheus metrics

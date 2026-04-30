@@ -26,6 +26,7 @@ data:
     [circuitBreaker]
     percentage = {{ .Values.circuitBreaker.percentage }}
     duration = {{ .Values.circuitBreaker.duration | quote }}
+    scope = {{ .Values.circuitBreaker.scope | default "all" | quote }}
     
     {{- range .Values.ruleSets }}
     [[rule-sets]]
