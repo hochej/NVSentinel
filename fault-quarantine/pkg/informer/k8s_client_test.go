@@ -23,6 +23,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -703,5 +704,87 @@ func TestUnTaintAndUnCordonNode_NonExistentNode(t *testing.T) {
 	err := k8sClient.UnQuarantineNodeAndRemoveAnnotations(ctx, "no-such-node", nil, nil, []string{}, map[string]string{})
 	if err == nil {
 		t.Errorf("Expected error for non-existent node, got nil")
+	}
+}
+
+func TestGetTotalNodes_FilteredBySelector(t *testing.T) {
+	ctx := context.Background()
+	k8sClient := setupTestClient(t)
+
+	gpuNodeA := testutils.GenerateTestNodeName("sel-gpu-a")
+	gpuNodeB := testutils.GenerateTestNodeName("sel-gpu-b")
+	cpuNode := testutils.GenerateTestNodeName("sel-cpu")
+
+	createTestNode(ctx, t, gpuNodeA, nil, map[string]string{"nvidia.com/gpu.present": "true"}, nil, false)
+	createTestNode(ctx, t, gpuNodeB, nil, map[string]string{"nvidia.com/gpu.present": "true"}, nil, false)
+	createTestNode(ctx, t, cpuNode, nil, nil, nil, false)
+
+	defer func() {
+		for _, name := range []string{gpuNodeA, gpuNodeB, cpuNode} {
+			_ = testClient.CoreV1().Nodes().Delete(ctx, name, metav1.DeleteOptions{})
+		}
+	}()
+
+	// Wait for the informer cache to observe all three nodes (other tests may
+	// also have nodes resident; this only validates that ours are visible).
+	pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	err := wait.PollUntilContextTimeout(pollCtx, 50*time.Millisecond, 5*time.Second, true,
+		func(ctx context.Context) (bool, error) {
+			for _, name := range []string{gpuNodeA, gpuNodeB, cpuNode} {
+				if _, err := k8sClient.NodeInformer.GetNode(name); err != nil {
+					return false, nil //nolint:nilerr // poll until visible
+				}
+			}
+			return true, nil
+		})
+	if err != nil {
+		t.Fatalf("nodes did not become visible in informer cache: %v", err)
+	}
+
+	// Without a selector, GetTotalNodes returns all cached nodes (legacy behaviour).
+	allCount, err := k8sClient.GetTotalNodes(ctx)
+	if err != nil {
+		t.Fatalf("GetTotalNodes (no selector) failed: %v", err)
+	}
+
+	// With the GPU selector, only the two GPU nodes are counted.
+	gpuSelector, err := labels.Parse("nvidia.com/gpu.present")
+	if err != nil {
+		t.Fatalf("failed to parse selector: %v", err)
+	}
+
+	k8sClient.SetEligibleNodeSelector(gpuSelector)
+
+	gpuCount, err := k8sClient.GetTotalNodes(ctx)
+	if err != nil {
+		t.Fatalf("GetTotalNodes (gpu selector) failed: %v", err)
+	}
+
+	if gpuCount >= allCount {
+		t.Fatalf("expected gpu-filtered count (%d) to be smaller than unfiltered count (%d)", gpuCount, allCount)
+	}
+
+	// Direct check on the new informer method as well.
+	eligible, err := k8sClient.NodeInformer.GetEligibleNodeCount(gpuSelector)
+	if err != nil {
+		t.Fatalf("GetEligibleNodeCount failed: %v", err)
+	}
+
+	if eligible != gpuCount {
+		t.Fatalf("GetEligibleNodeCount (%d) and GetTotalNodes (%d) disagree", eligible, gpuCount)
+	}
+
+	// A nil selector falls back to counting everything.
+	k8sClient.SetEligibleNodeSelector(nil)
+
+	resetCount, err := k8sClient.GetTotalNodes(ctx)
+	if err != nil {
+		t.Fatalf("GetTotalNodes (reset selector) failed: %v", err)
+	}
+
+	if resetCount != allCount {
+		t.Fatalf("expected reset count (%d) to match unfiltered count (%d)", resetCount, allCount)
 	}
 }

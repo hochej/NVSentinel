@@ -202,8 +202,11 @@ func (b *slidingWindowBreaker) IsTripped(ctx context.Context) (bool, error) {
 	}
 
 	if totalNodes == 0 {
-		slog.ErrorContext(ctx, "Total nodes is still 0 after all retry attempts - cluster may have no GPU nodes")
-		return false, fmt.Errorf("total nodes is 0 after retries")
+		slog.ErrorContext(ctx,
+			"Eligible node count is still 0 after all retry attempts - "+
+				"check that the configured circuit breaker nodeSelector matches at least one node")
+
+		return false, fmt.Errorf("eligible node count is 0 after retries")
 	}
 
 	now := time.Now()

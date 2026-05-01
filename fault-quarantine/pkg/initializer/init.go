@@ -21,6 +21,8 @@ import (
 	"os"
 	"time"
 
+	"k8s.io/apimachinery/pkg/labels"
+
 	"github.com/nvidia/nvsentinel/commons/pkg/configmanager"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/breaker"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/config"
@@ -31,6 +33,13 @@ import (
 	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
 	_ "github.com/nvidia/nvsentinel/store-client/pkg/datastore/providers"
 )
+
+// DefaultCircuitBreakerNodeSelector is the label selector used to scope the
+// circuit breaker's trip-threshold denominator when no selector is configured.
+// It matches nodes labelled by the NVIDIA GPU Operator's node-feature-discovery
+// rule and aligns the denominator with the GPU-only event population that
+// drives the numerator (issue #1228).
+const DefaultCircuitBreakerNodeSelector = "nvidia.com/gpu.present"
 
 type InitializationParams struct {
 	KubeconfigPath              string
@@ -153,7 +162,14 @@ func setupCircuitBreaker(
 	// Use command line parameters if provided, otherwise fall back to TOML config
 	cbConfig := tomlCfg.CircuitBreaker
 
-	cb, err := initializeCircuitBreaker(ctx, k8sClient, cbConfig)
+	selector, err := parseCircuitBreakerNodeSelector(cbConfig.NodeSelector)
+	if err != nil {
+		return nil, fmt.Errorf("error while parsing circuit breaker nodeSelector: %w", err)
+	}
+
+	k8sClient.SetEligibleNodeSelector(selector)
+
+	cb, err := initializeCircuitBreaker(ctx, k8sClient, cbConfig, selector)
 	if err != nil {
 		return nil, fmt.Errorf("error while initializing circuit breaker: %w", err)
 	}
@@ -163,10 +179,28 @@ func setupCircuitBreaker(
 	return cb, nil
 }
 
+// parseCircuitBreakerNodeSelector validates the configured selector string and
+// returns the parsed labels.Selector. An empty string falls back to
+// DefaultCircuitBreakerNodeSelector so that, by default, only GPU nodes are
+// counted toward the breaker's denominator (issue #1228).
+func parseCircuitBreakerNodeSelector(raw string) (labels.Selector, error) {
+	if raw == "" {
+		raw = DefaultCircuitBreakerNodeSelector
+	}
+
+	selector, err := labels.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid label selector %q: %w", raw, err)
+	}
+
+	return selector, nil
+}
+
 func initializeCircuitBreaker(
 	ctx context.Context,
 	k8sClient *informer.FaultQuarantineClient,
 	cbConfig config.CircuitBreaker,
+	selector labels.Selector,
 ) (breaker.CircuitBreaker, error) {
 	circuitBreakerName := "circuit-breaker"
 
@@ -181,7 +215,8 @@ func initializeCircuitBreaker(
 		"configMap", circuitBreakerName,
 		"namespace", namespace,
 		"percentage", cbConfig.Percentage,
-		"duration", cbConfig.Duration)
+		"duration", cbConfig.Duration,
+		"nodeSelector", selector.String())
 
 	cb, err := breaker.NewSlidingWindowBreaker(ctx, breaker.Config{
 		Window:             duration,

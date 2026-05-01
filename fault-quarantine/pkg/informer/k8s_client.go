@@ -25,6 +25,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -44,12 +45,23 @@ var customBackoff = wait.Backoff{
 }
 
 type FaultQuarantineClient struct {
-	Clientset                kubernetes.Interface
-	DryRunMode               bool
-	NodeInformer             *NodeInformer
+	Clientset    kubernetes.Interface
+	DryRunMode   bool
+	NodeInformer *NodeInformer
+	// eligibleNodeSelector restricts which nodes are counted by GetTotalNodes.
+	// When nil, all nodes are counted (preserving historical behaviour for
+	// callers that have not configured a selector, e.g. existing tests).
+	eligibleNodeSelector     labels.Selector
 	cordonedReasonLabelKey   string
 	uncordonedReasonLabelKey string
 	operationMutex           sync.Map // map[string]*sync.Mutex for per-node locking
+}
+
+// SetEligibleNodeSelector configures the label selector used by GetTotalNodes
+// to filter which nodes contribute to the circuit breaker's trip-threshold
+// denominator. A nil selector restores counting of all nodes.
+func (c *FaultQuarantineClient) SetEligibleNodeSelector(selector labels.Selector) {
+	c.eligibleNodeSelector = selector
 }
 
 func NewFaultQuarantineClient(kubeconfig string, dryRun bool,
@@ -119,13 +131,24 @@ func (c *FaultQuarantineClient) EnsureCircuitBreakerConfigMap(ctx context.Contex
 	return nil
 }
 
+// GetTotalNodes returns the number of nodes that should be used as the
+// denominator for the fault-quarantine circuit breaker. When an eligible-node
+// selector has been configured (see SetEligibleNodeSelector), only nodes
+// matching it are counted; otherwise all cached nodes are returned.
 func (c *FaultQuarantineClient) GetTotalNodes(ctx context.Context) (int, error) {
-	totalNodes, _, err := c.NodeInformer.GetNodeCounts()
+	totalNodes, err := c.NodeInformer.GetEligibleNodeCount(c.eligibleNodeSelector)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get node counts from informer: %w", err)
+		return 0, fmt.Errorf("failed to get eligible node count from informer: %w", err)
 	}
 
-	slog.DebugContext(ctx, "Got total nodes from NodeInformer cache", "totalNodes", totalNodes)
+	selectorStr := ""
+	if c.eligibleNodeSelector != nil {
+		selectorStr = c.eligibleNodeSelector.String()
+	}
+
+	slog.DebugContext(ctx, "Got eligible node count from NodeInformer cache",
+		"totalNodes", totalNodes,
+		"nodeSelector", selectorStr)
 
 	return totalNodes, nil
 }

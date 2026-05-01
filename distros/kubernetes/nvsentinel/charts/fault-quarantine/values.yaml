@@ -60,6 +60,17 @@ circuitBreaker:
   # The circuit breaker counts cordon events within this time window
   # Example: "5m" means if 50% of nodes are cordoned within any 5-minute window, the circuit breaker trips
   duration: "5m"
+  # Kubernetes label selector (kubectl --selector syntax) used to scope the
+  # circuit breaker's denominator. Only nodes matching this selector are
+  # counted as the "total" against which `percentage` is evaluated.
+  # Defaults to "nvidia.com/gpu.present" so that adding/removing CPU-only
+  # nodes (which can never produce cordon events) does not shift the trip
+  # threshold. Set to an empty string only if you want to count every node
+  # in the cluster (legacy behaviour, not recommended).
+  # Examples:
+  #   nodeSelector: "nvidia.com/gpu.present"
+  #   nodeSelector: "nvidia.com/gpu.present,node-role.kubernetes.io/worker"
+  nodeSelector: "nvidia.com/gpu.present"
 
 # Rule sets for node quarantine actions
 # Each ruleset defines conditions (match) and actions (taint, cordon) to apply when conditions are met

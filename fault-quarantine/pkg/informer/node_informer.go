@@ -173,6 +173,32 @@ func (ni *NodeInformer) GetNodeCounts() (totalNodes int, quarantinedNodesMap map
 	return total, quarantinedMap, nil
 }
 
+// GetEligibleNodeCount returns the number of cached nodes that match the given
+// label selector. A nil selector is treated as labels.Everything() and counts
+// all nodes (preserving the historical GetNodeCounts() behaviour for callers
+// that have not yet adopted a selector).
+//
+// This method is the selector-aware counterpart to GetNodeCounts and is used
+// by the fault-quarantine circuit breaker to keep its trip-threshold
+// denominator scoped to the same population that can produce cordon events
+// (see issue #1228).
+func (ni *NodeInformer) GetEligibleNodeCount(selector labels.Selector) (int, error) {
+	if !ni.HasSynced() {
+		return 0, fmt.Errorf("node informer cache not synced yet")
+	}
+
+	if selector == nil {
+		selector = labels.Everything()
+	}
+
+	nodes, err := ni.lister.List(selector)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list nodes matching selector %q: %w", selector.String(), err)
+	}
+
+	return len(nodes), nil
+}
+
 // GetNode retrieves a node from the informer's cache.
 func (ni *NodeInformer) GetNode(name string) (*v1.Node, error) {
 	return ni.lister.Get(name)

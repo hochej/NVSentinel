@@ -32,6 +32,14 @@ type Cordon struct {
 type CircuitBreaker struct {
 	Percentage int    `toml:"percentage"`
 	Duration   string `toml:"duration"`
+	// NodeSelector is a Kubernetes label selector (kubectl --selector syntax,
+	// e.g. "nvidia.com/gpu.present" or "nvidia.com/gpu.present,!cpu-only")
+	// used to filter nodes that contribute to the circuit breaker denominator.
+	// Only nodes matching this selector are counted as the "total" against which
+	// the trip percentage is evaluated, keeping the denominator scoped to the
+	// same population that can produce cordon events. An empty value defaults to
+	// "nvidia.com/gpu.present" (see fault-quarantine initializer).
+	NodeSelector string `toml:"nodeSelector"`
 }
 
 type Match struct {
