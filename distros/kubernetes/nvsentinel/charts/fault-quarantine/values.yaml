@@ -58,10 +58,11 @@ circuitBreaker:
   percentage: 50
   # Time window for the sliding window circuit breaker
   # The circuit breaker counts cordon events within this time window
-  # Example: "5m" means if 50% of nodes are cordoned within any 5-minute window, the circuit breaker trips
+  # Example: "5m" means if 50% of selected nodes are cordoned within any 5-minute window, the circuit breaker trips
   duration: "5m"
   # Kubernetes label selector for nodes included in circuit breaker accounting
   # Helm defaults to GPU nodes to match the default GPU-oriented quarantine rules.
+  # Quarantine actions on non-matching nodes are still allowed, but they do not count toward the breaker.
   # Set to "" to include all nodes.
   nodeSelector: "nvidia.com/gpu.present=true"
 

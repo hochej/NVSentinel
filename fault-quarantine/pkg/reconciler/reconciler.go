@@ -455,7 +455,7 @@ func (r *Reconciler) ProcessEvent(
 ) *model.Status {
 	span := tracing.SpanFromContext(ctx)
 
-	nodeInCircuitBreakerScope, shouldHalt := r.checkCircuitBreakerAndHalt(ctx, event.HealthEvent.NodeName)
+	nodeInCircuitBreakerScope, shouldHalt := r.checkCircuitBreakerAndHalt(ctx, event.HealthEvent)
 	if shouldHalt {
 		span.SetAttributes(attribute.String("fault_quarantine.event.processing_status", EventProcessingStatusHalted))
 
@@ -487,19 +487,25 @@ func (r *Reconciler) ProcessEvent(
 
 // checkCircuitBreakerAndHalt checks if circuit breaker is tripped and returns the
 // current node's circuit-breaker scope membership plus whether processing should halt.
-func (r *Reconciler) checkCircuitBreakerAndHalt(ctx context.Context, nodeName string) (bool, bool) {
+func (r *Reconciler) checkCircuitBreakerAndHalt(ctx context.Context, event *protos.HealthEvent) (bool, bool) {
 	span := tracing.SpanFromContext(ctx)
 
 	if !r.config.CircuitBreakerEnabled {
+		// Scope is ignored while the circuit breaker is disabled.
 		return true, false
 	}
 
+	if r.isForceQuarantine(event) {
+		// Force-quarantine bypasses both the trip check and breaker event recording.
+		return false, false
+	}
+
 	for {
-		result, err := r.cb.CheckCircuitBreakerForNode(ctx, nodeName)
+		result, err := r.cb.CheckCircuitBreakerForNode(ctx, event.NodeName)
 		if err != nil {
 			if errors.Is(err, breaker.ErrEmptyCircuitBreakerScope) {
 				slog.WarnContext(ctx, "Circuit breaker node selector matches no nodes; pausing event processing until scope is non-empty",
-					"node", nodeName)
+					"node", event.NodeName)
 				span.SetAttributes(attribute.String("fault_quarantine.circuit_breaker.state", "scope_empty"))
 			} else {
 				slog.ErrorContext(ctx, "Error checking if circuit breaker is tripped", "error", err)

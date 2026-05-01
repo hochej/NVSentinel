@@ -63,12 +63,12 @@ func NewSlidingWindowBreaker(ctx context.Context, cfg Config) (CircuitBreaker, e
 		startTime:    time.Now(),
 		state:        StateClosed,
 		nodeToEvent:  make(map[string]cordonEvent),
-		indexToNodes: make(map[int]map[string]cordonEvent),
+		indexToNodes: make(map[int]map[string]struct{}),
 	}
 
 	// Initialize indexToNodes for all buckets
 	for i := range numBuckets {
-		b.indexToNodes[i] = make(map[string]cordonEvent)
+		b.indexToNodes[i] = make(map[string]struct{})
 	}
 
 	err := cfg.K8sClient.EnsureCircuitBreakerConfigMap(ctx, cfg.ConfigMapName, cfg.ConfigMapNamespace, StateClosed)
@@ -131,7 +131,7 @@ func (b *slidingWindowBreaker) slideWindow(now time.Time) {
 			b.indexToNodes[i] = b.indexToNodes[i+1]
 		}
 
-		b.indexToNodes[len(b.indexToNodes)-1] = make(map[string]cordonEvent)
+		b.indexToNodes[len(b.indexToNodes)-1] = make(map[string]struct{})
 
 		// Update all node indices (decrement by 1)
 		for nodeName, event := range b.nodeToEvent {
@@ -196,7 +196,7 @@ func (b *slidingWindowBreaker) AddCordonEventWithScope(nodeName string, inScope 
 		"inScope", inScope)
 
 	b.nodeToEvent[nodeName] = event
-	b.indexToNodes[currentBucketIndex][nodeName] = event
+	b.indexToNodes[currentBucketIndex][nodeName] = struct{}{}
 	b.buckets[currentBucketIndex]++
 }
 
@@ -234,14 +234,25 @@ func (b *slidingWindowBreaker) IsTripped(ctx context.Context) (bool, error) {
 
 func (b *slidingWindowBreaker) checkCircuitBreaker(ctx context.Context, nodeName string) (CheckResult, error) {
 	b.mu.RLock()
-
-	if b.state == StateTripped {
-		b.mu.RUnlock()
-
-		return CheckResult{Tripped: true}, nil
-	}
-
+	alreadyTripped := b.state == StateTripped
 	b.mu.RUnlock()
+
+	if alreadyTripped {
+		if nodeName == "" {
+			return CheckResult{Tripped: true}, nil
+		}
+
+		scope, err := b.cfg.K8sClient.GetCircuitBreakerNodeScope(ctx, nodeName, b.cfg.NodeSelector)
+		if err != nil {
+			return CheckResult{}, fmt.Errorf("failed to get circuit breaker node scope while tripped: %w", err)
+		}
+
+		return CheckResult{
+			Tripped:         true,
+			NodeInScope:     scope.NodeInScope,
+			ScopedNodeCount: scope.ScopedNodeCount,
+		}, nil
+	}
 
 	scope, err := b.getNodeScopeWithRetry(ctx, nodeName)
 	if err != nil {
@@ -252,11 +263,6 @@ func (b *slidingWindowBreaker) checkCircuitBreaker(ctx context.Context, nodeName
 		slog.ErrorContext(ctx, "Failed to get circuit breaker node scope after retries", "error", err)
 
 		return CheckResult{}, fmt.Errorf("failed to get circuit breaker node scope after retries: %w", err)
-	}
-
-	if scope.ScopedNodeCount == 0 {
-		metrics.SetFaultQuarantineBreakerState(string(StateScopeEmpty))
-		return CheckResult{}, ErrEmptyCircuitBreakerScope
 	}
 
 	now := time.Now()
@@ -361,31 +367,36 @@ func (b *slidingWindowBreaker) getNodeScopeWithRetry(ctx context.Context, nodeNa
 
 	maxRetries, initialDelay, maxDelay := b.getRetryConfig()
 
+	var lastErr error
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		scope, err := b.cfg.K8sClient.GetCircuitBreakerNodeScope(ctx, nodeName, b.cfg.NodeSelector)
 		if err != nil {
-			result = resultError
-			errorType = "api_error"
-
-			return NodeScope{}, b.handleGetNodeScopeError(err, attempt, maxRetries)
-		}
-
-		if scope.ScopedNodeCount > 0 {
+			lastErr = err
+			b.logGetNodeScopeError(err, attempt, maxRetries)
+		} else if scope.ScopedNodeCount > 0 {
 			result = "success"
 
 			metrics.FaultQuarantineGetTotalNodesRetryAttempts.Observe(float64(attempt))
 
 			return b.handleSuccessfulNodeScope(scope, attempt), nil
-		}
+		} else {
+			lastErr = nil
 
-		if attempt == 0 {
-			slog.InfoContext(ctx, "Circuit breaker starting retries: node selector currently matches 0 nodes",
-				"maxRetries", maxRetries,
-				"nodeSelector", b.cfg.NodeSelector.String())
+			if attempt == 0 {
+				slog.InfoContext(ctx, "Circuit breaker starting retries: node selector currently matches 0 nodes",
+					"maxRetries", maxRetries,
+					"nodeSelector", b.cfg.NodeSelector.String())
+			}
 		}
 
 		if attempt < maxRetries {
-			if err := b.performRetryDelay(ctx, attempt, maxRetries, initialDelay, maxDelay); err != nil {
+			reason := "node selector matched 0 nodes"
+			if err != nil {
+				reason = "node scope lookup failed"
+			}
+
+			if err := b.performRetryDelay(ctx, attempt, maxRetries, initialDelay, maxDelay, reason); err != nil {
 				result = resultError
 				errorType = "context_cancelled"
 
@@ -395,6 +406,11 @@ func (b *slidingWindowBreaker) getNodeScopeWithRetry(ctx context.Context, nodeNa
 	}
 
 	result = resultError
+	if lastErr != nil {
+		errorType = "api_error"
+		return NodeScope{}, b.logNodeScopeRetriesExhausted(ctx, maxRetries, initialDelay, maxDelay, lastErr)
+	}
+
 	errorType = "empty_scope"
 
 	return NodeScope{}, b.logEmptyScopeAfterRetries(ctx, maxRetries, initialDelay, maxDelay)
@@ -420,14 +436,12 @@ func (b *slidingWindowBreaker) getRetryConfig() (int, time.Duration, time.Durati
 	return maxRetries, initialDelay, maxDelay
 }
 
-// handleGetNodeScopeError handles errors from GetCircuitBreakerNodeScope.
-func (b *slidingWindowBreaker) handleGetNodeScopeError(err error, attempt, maxRetries int) error {
+// logGetNodeScopeError logs errors from GetCircuitBreakerNodeScope.
+func (b *slidingWindowBreaker) logGetNodeScopeError(err error, attempt, maxRetries int) {
 	slog.Error("GetCircuitBreakerNodeScope failed on attempt",
 		"attempt", attempt+1,
 		"maxAttempts", maxRetries+1,
 		"error", err)
-
-	return fmt.Errorf("GetCircuitBreakerNodeScope failed: %w", err)
 }
 
 // handleSuccessfulNodeScope handles the success case when selected nodes > 0.
@@ -444,10 +458,11 @@ func (b *slidingWindowBreaker) handleSuccessfulNodeScope(scope NodeScope, attemp
 
 // performRetryDelay calculates and performs the exponential backoff delay
 func (b *slidingWindowBreaker) performRetryDelay(ctx context.Context, attempt, maxRetries int,
-	initialDelay, maxDelay time.Duration) error {
+	initialDelay, maxDelay time.Duration, reason string) error {
 	delay := b.calculateBackoffDelay(attempt, initialDelay, maxDelay)
 
-	slog.DebugContext(ctx, "Circuit breaker retry; node selector matched 0 nodes, retrying",
+	slog.DebugContext(ctx, "Circuit breaker retry",
+		"reason", reason,
 		"attempt", attempt+1,
 		"maxRetries", maxRetries,
 		"delay", delay)
@@ -478,6 +493,20 @@ func (b *slidingWindowBreaker) calculateBackoffDelay(attempt int,
 	}
 
 	return delay
+}
+
+// logNodeScopeRetriesExhausted logs a summary when scope lookups keep failing after all retries.
+func (b *slidingWindowBreaker) logNodeScopeRetriesExhausted(ctx context.Context, maxRetries int,
+	initialDelay, maxDelay time.Duration, lastErr error) error {
+	slog.ErrorContext(ctx, "Circuit breaker node scope lookup failed after all retry attempts",
+		"maxRetries", maxRetries,
+		"initialDelay", initialDelay,
+		"maxDelay", maxDelay,
+		"nodeSelector", b.cfg.NodeSelector.String(),
+		"error", lastErr)
+
+	return fmt.Errorf("%w: GetCircuitBreakerNodeScope failed after %d retries: %w",
+		ErrRetryExhausted, maxRetries, lastErr)
 }
 
 // logEmptyScopeAfterRetries logs a summary when the configured selector matches no nodes

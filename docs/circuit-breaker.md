@@ -50,7 +50,7 @@ fault-quarantine:
     nodeSelector: "nvidia.com/gpu.present=true"  # Nodes counted by breaker; "" = all nodes
 ```
 
-**Example:** With `percentage: 50`, `duration: "5m"`, and `nodeSelector: "nvidia.com/gpu.present=true"`, if 50% or more of your GPU nodes are cordoned within any 5-minute period, the circuit breaker will trip.
+**Example:** With `percentage: 50`, `duration: "5m"`, and `nodeSelector: "nvidia.com/gpu.present=true"`, if 50% or more of your GPU nodes are cordoned within any 5-minute period, the circuit breaker will trip. Quarantine actions on non-matching nodes are still allowed, but they do not count toward breaker utilization.
 
 **Recommended Settings:**
 - For production clusters with 10+ nodes: Keep enabled with 50% threshold

@@ -85,7 +85,7 @@ Maximum percentage of selected nodes that can be quarantined within the time win
 Time window for tracking cordon events. The circuit breaker counts unique node cordons within this sliding window.
 
 #### nodeSelector
-Kubernetes label selector for nodes included in circuit breaker accounting. The Helm default is `nvidia.com/gpu.present=true`, matching the default GPU-oriented quarantine rules. Set to `""` to include all nodes.
+Kubernetes label selector for nodes included in circuit breaker accounting. The Helm default is `nvidia.com/gpu.present=true`, matching the default GPU-oriented quarantine rules. Quarantine actions on non-matching nodes are still allowed, but they do not count toward breaker utilization. Set to `""` to include all nodes.
 
 ### Configuration Examples
 

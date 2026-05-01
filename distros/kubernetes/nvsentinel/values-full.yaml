@@ -436,6 +436,7 @@ fault-quarantine:
     duration: "5m"
     # Kubernetes label selector for nodes included in circuit breaker accounting
     # Defaults to GPU nodes for the default GPU-oriented quarantine rules.
+    # Quarantine actions on non-matching nodes are still allowed, but they do not count toward the breaker.
     # Set to "" to include all nodes.
     nodeSelector: "nvidia.com/gpu.present=true"
 

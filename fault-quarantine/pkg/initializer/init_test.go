@@ -37,6 +37,6 @@ func TestParseCircuitBreakerNodeSelectorUsesKubernetesLabelSelectorSyntax(t *tes
 }
 
 func TestParseCircuitBreakerNodeSelectorRejectsInvalidSelector(t *testing.T) {
-	_, err := parseCircuitBreakerNodeSelector("not in")
+	_, err := parseCircuitBreakerNodeSelector("==!=foo")
 	require.Error(t, err)
 }

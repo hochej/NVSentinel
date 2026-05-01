@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+{{- $rawCircuitBreakerNodeSelector := .Values.circuitBreaker.nodeSelector -}}
+{{- if not (or (kindIs "invalid" $rawCircuitBreakerNodeSelector) (kindIs "string" $rawCircuitBreakerNodeSelector)) -}}
+{{- fail "fault-quarantine.circuitBreaker.nodeSelector must be a string" -}}
+{{- end -}}
+{{- $circuitBreakerNodeSelector := $rawCircuitBreakerNodeSelector | default "" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -26,7 +31,7 @@ data:
     [circuitBreaker]
     percentage = {{ .Values.circuitBreaker.percentage }}
     duration = {{ .Values.circuitBreaker.duration | quote }}
-    nodeSelector = {{ .Values.circuitBreaker.nodeSelector | quote }}
+    nodeSelector = {{ $circuitBreakerNodeSelector | quote }}
     
     {{- range .Values.ruleSets }}
     [[rule-sets]]

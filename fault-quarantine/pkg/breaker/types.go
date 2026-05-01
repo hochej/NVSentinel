@@ -32,7 +32,6 @@ const (
 
 // K8sClientOperations defines the minimal interface needed by the circuit breaker
 type K8sClientOperations interface {
-	GetTotalNodes(ctx context.Context) (int, error)
 	GetCircuitBreakerNodeScope(ctx context.Context, nodeName string, selector labels.Selector) (NodeScope, error)
 	EnsureCircuitBreakerConfigMap(ctx context.Context, name, namespace string, initialStatus State) error
 	ReadCircuitBreakerState(ctx context.Context, name, namespace string) (State, error)
@@ -157,8 +156,8 @@ type slidingWindowBreaker struct {
 	// nodeToEvent maps node name to the bucket index where it was last cordoned and
 	// whether that event was in the configured circuit-breaker node scope.
 	nodeToEvent map[string]cordonEvent
-	// indexToNodes maps bucket index to the node events recorded in that bucket.
-	indexToNodes map[int]map[string]cordonEvent
+	// indexToNodes maps bucket index to the node names recorded in that bucket.
+	indexToNodes map[int]map[string]struct{}
 
 	// state is the current breaker state (CLOSED or TRIPPED)
 	// Can be manually forced via ForceState() or automatically set by IsTripped()
