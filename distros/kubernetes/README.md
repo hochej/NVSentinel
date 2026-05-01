@@ -145,8 +145,9 @@ fault-quarantine:
   # Circuit breaker to prevent mass quarantines
   circuitBreaker:
     enabled: true
-    percentage: 50    # Max % of nodes to quarantine
-    duration: "5m"    # Cooldown period
+    percentage: 50    # Max % of selected nodes to quarantine
+    duration: "5m"    # Sliding window period
+    nodeSelector: "nvidia.com/gpu.present=true"  # Nodes counted by breaker; "" = all nodes
 
   # Quarantine rules
   ruleSets:

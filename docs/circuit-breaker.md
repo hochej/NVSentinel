@@ -45,11 +45,12 @@ Configure the circuit breaker through your Helm values:
 fault-quarantine:
   circuitBreaker:
     enabled: true      # Enable or disable the protection
-    percentage: 50     # Percentage of nodes that can be cordoned
+    percentage: 50     # Percentage of selected nodes that can be cordoned
     duration: "5m"     # Time window to monitor
+    nodeSelector: "nvidia.com/gpu.present=true"  # Nodes counted by breaker; "" = all nodes
 ```
 
-**Example:** With `percentage: 50` and `duration: "5m"`, if 50% or more of your cluster nodes are cordoned within any 5-minute period, the circuit breaker will trip.
+**Example:** With `percentage: 50`, `duration: "5m"`, and `nodeSelector: "nvidia.com/gpu.present=true"`, if 50% or more of your GPU nodes are cordoned within any 5-minute period, the circuit breaker will trip.
 
 **Recommended Settings:**
 - For production clusters with 10+ nodes: Keep enabled with 50% threshold
@@ -80,16 +81,17 @@ metadata:
 **Status meanings:**
 - `CLOSED`: Normal operation - the circuit breaker is monitoring but not blocking actions
 - `TRIPPED`: Protection mode - new node remediation actions are blocked (any in-progress operations will complete)
+- `SCOPE_EMPTY` (metric only): configured `nodeSelector` currently matches no nodes, so event processing is paused until the scope is non-empty
 
 ### Monitor via Prometheus Metrics
 
 NVSentinel exposes metrics for monitoring and alerting:
 
 ```
-# Current circuit breaker state (1 = TRIPPED, 0 = CLOSED)
+# Current circuit breaker state (one of CLOSED, TRIPPED, or SCOPE_EMPTY)
 fault_quarantine_breaker_state{state="TRIPPED"}
 
-# Percentage of cluster currently cordoned (useful for dashboards)
+# Percentage of selected circuit-breaker nodes currently cordoned (useful for dashboards)
 fault_quarantine_breaker_utilization
 ```
 

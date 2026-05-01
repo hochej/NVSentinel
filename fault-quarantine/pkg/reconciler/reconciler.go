@@ -50,6 +50,8 @@ const (
 	EventProcessingStatusSkipped         = "skipped"
 	EventProcessingStatusHalted          = "halted"
 	EventProcessingStatusPartialRecovery = "partial_recovery"
+
+	circuitBreakerScopeRetryDelay = 30 * time.Second
 )
 
 type ReconcilerConfig struct {
@@ -364,6 +366,11 @@ func (r *Reconciler) checkCircuitBreakerAtStartup(ctx context.Context) error {
 
 	tripped, err := r.cb.IsTripped(ctx)
 	if err != nil {
+		if errors.Is(err, breaker.ErrEmptyCircuitBreakerScope) {
+			slog.WarnContext(ctx, "Circuit breaker node selector matches no nodes at startup; continuing in paused mode until scope is non-empty")
+			return nil
+		}
+
 		if errors.Is(err, breaker.ErrRetryExhausted) {
 			return err
 		}
@@ -448,7 +455,8 @@ func (r *Reconciler) ProcessEvent(
 ) *model.Status {
 	span := tracing.SpanFromContext(ctx)
 
-	if shouldHalt := r.checkCircuitBreakerAndHalt(ctx); shouldHalt {
+	nodeInCircuitBreakerScope, shouldHalt := r.checkCircuitBreakerAndHalt(ctx, event.HealthEvent.NodeName)
+	if shouldHalt {
 		span.SetAttributes(attribute.String("fault_quarantine.event.processing_status", EventProcessingStatusHalted))
 
 		return nil
@@ -456,7 +464,7 @@ func (r *Reconciler) ProcessEvent(
 
 	slog.DebugContext(ctx, "Processing event", "checkName", event.HealthEvent.CheckName)
 
-	isNodeQuarantined := r.handleEvent(ctx, event, ruleSetEvals, rulesetsConfig)
+	isNodeQuarantined := r.handleEvent(ctx, event, ruleSetEvals, rulesetsConfig, nodeInCircuitBreakerScope)
 
 	if isNodeQuarantined == nil {
 		slog.DebugContext(ctx, "Skipped processing event for node, no status update needed",
@@ -477,41 +485,62 @@ func (r *Reconciler) ProcessEvent(
 	return isNodeQuarantined
 }
 
-// checkCircuitBreakerAndHalt checks if circuit breaker is tripped and returns true if processing should halt
-func (r *Reconciler) checkCircuitBreakerAndHalt(ctx context.Context) bool {
+// checkCircuitBreakerAndHalt checks if circuit breaker is tripped and returns the
+// current node's circuit-breaker scope membership plus whether processing should halt.
+func (r *Reconciler) checkCircuitBreakerAndHalt(ctx context.Context, nodeName string) (bool, bool) {
 	span := tracing.SpanFromContext(ctx)
 
 	if !r.config.CircuitBreakerEnabled {
+		return true, false
+	}
+
+	for {
+		result, err := r.cb.CheckCircuitBreakerForNode(ctx, nodeName)
+		if err != nil {
+			if errors.Is(err, breaker.ErrEmptyCircuitBreakerScope) {
+				slog.WarnContext(ctx, "Circuit breaker node selector matches no nodes; pausing event processing until scope is non-empty",
+					"node", nodeName)
+				span.SetAttributes(attribute.String("fault_quarantine.circuit_breaker.state", "scope_empty"))
+			} else {
+				slog.ErrorContext(ctx, "Error checking if circuit breaker is tripped", "error", err)
+				tracing.RecordError(span, err)
+				span.SetAttributes(
+					attribute.String("fault_quarantine.error.type", "check_circuit_breaker_state_error"),
+					attribute.String("fault_quarantine.error.message", err.Error()),
+				)
+			}
+
+			if !waitForCircuitBreakerRetry(ctx) {
+				return false, true
+			}
+
+			continue
+		}
+
+		if result.Tripped {
+			slog.ErrorContext(ctx, "Circuit breaker TRIPPED. Halting event processing until restart and breaker reset.")
+
+			span.SetAttributes(
+				attribute.String("fault_quarantine.circuit_breaker.state", "tripped"),
+				attribute.Bool("fault_quarantine.circuit_breaker.tripped", true),
+			)
+
+			<-ctx.Done()
+
+			return result.NodeInScope, true
+		}
+
+		return result.NodeInScope, false
+	}
+}
+
+func waitForCircuitBreakerRetry(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
 		return false
-	}
-
-	tripped, err := r.cb.IsTripped(ctx)
-	if err != nil {
-		slog.ErrorContext(ctx, "Error checking if circuit breaker is tripped", "error", err)
-		tracing.RecordError(span, err)
-		span.SetAttributes(
-			attribute.String("fault_quarantine.error.type", "check_circuit_breaker_state_error"),
-			attribute.String("fault_quarantine.error.message", err.Error()),
-		)
-		<-ctx.Done()
-
+	case <-time.After(circuitBreakerScopeRetryDelay):
 		return true
 	}
-
-	if tripped {
-		slog.ErrorContext(ctx, "Circuit breaker TRIPPED. Halting event processing until restart and breaker reset.")
-
-		span.SetAttributes(
-			attribute.String("fault_quarantine.circuit_breaker.state", "tripped"),
-			attribute.Bool("fault_quarantine.circuit_breaker.tripped", true),
-		)
-
-		<-ctx.Done()
-
-		return true
-	}
-
-	return false
 }
 
 func (r *Reconciler) handleEvent(
@@ -519,6 +548,7 @@ func (r *Reconciler) handleEvent(
 	event *model.HealthEventWithStatus,
 	ruleSetEvals []evaluator.RuleSetEvaluatorIface,
 	rulesetsConfig rulesetsConfig,
+	nodeInCircuitBreakerScope bool,
 ) *model.Status {
 	ctx, span := tracing.StartSpan(ctx, "fault_quarantine.handle_event")
 	defer span.End()
@@ -577,7 +607,7 @@ func (r *Reconciler) handleEvent(
 
 	status := r.applyQuarantine(
 		ctx, event, annotations, taintsToBeApplied,
-		annotationsMap, &labelsMap, &isCordoned,
+		annotationsMap, &labelsMap, &isCordoned, nodeInCircuitBreakerScope,
 	)
 
 	return status
@@ -890,11 +920,12 @@ func (r *Reconciler) applyQuarantine(
 	annotationsMap map[string]string,
 	labelsMap *sync.Map,
 	isCordoned *atomic.Bool,
+	nodeInCircuitBreakerScope bool,
 ) *model.Status {
 	ctx, span := tracing.StartSpan(ctx, "fault_quarantine.apply_quarantine")
 	defer span.End()
 
-	r.recordCordonEventInCircuitBreaker(event)
+	r.recordCordonEventInCircuitBreaker(event, nodeInCircuitBreakerScope)
 
 	healthEvents := healthEventsAnnotation.NewHealthEventsAnnotationMap()
 	updated := healthEvents.AddOrUpdateEvent(event.HealthEvent)
@@ -988,11 +1019,11 @@ func syncMapToStringMap(m *sync.Map) map[string]string {
 	return result
 }
 
-// recordCordonEventInCircuitBreaker records a cordon event in the circuit breaker if enabled
-func (r *Reconciler) recordCordonEventInCircuitBreaker(event *model.HealthEventWithStatus) {
+// recordCordonEventInCircuitBreaker records a cordon event in the circuit breaker if enabled.
+func (r *Reconciler) recordCordonEventInCircuitBreaker(event *model.HealthEventWithStatus, nodeInCircuitBreakerScope bool) {
 	if r.config.CircuitBreakerEnabled &&
 		(event.HealthEvent.QuarantineOverrides == nil || !event.HealthEvent.QuarantineOverrides.Force) {
-		r.cb.AddCordonEvent(event.HealthEvent.NodeName)
+		r.cb.AddCordonEventWithScope(event.HealthEvent.NodeName, nodeInCircuitBreakerScope)
 	}
 }
 

@@ -30,8 +30,9 @@ type Cordon struct {
 }
 
 type CircuitBreaker struct {
-	Percentage int    `toml:"percentage"`
-	Duration   string `toml:"duration"`
+	Percentage   int    `toml:"percentage"`
+	Duration     string `toml:"duration"`
+	NodeSelector string `toml:"nodeSelector"`
 }
 
 type Match struct {

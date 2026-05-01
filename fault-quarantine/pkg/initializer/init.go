@@ -21,6 +21,8 @@ import (
 	"os"
 	"time"
 
+	"k8s.io/apimachinery/pkg/labels"
+
 	"github.com/nvidia/nvsentinel/commons/pkg/configmanager"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/breaker"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/config"
@@ -163,6 +165,19 @@ func setupCircuitBreaker(
 	return cb, nil
 }
 
+func parseCircuitBreakerNodeSelector(rawSelector string) (labels.Selector, error) {
+	if rawSelector == "" {
+		return labels.Everything(), nil
+	}
+
+	nodeSelector, err := labels.Parse(rawSelector)
+	if err != nil {
+		return nil, fmt.Errorf("invalid circuit breaker nodeSelector %q: %w", rawSelector, err)
+	}
+
+	return nodeSelector, nil
+}
+
 func initializeCircuitBreaker(
 	ctx context.Context,
 	k8sClient *informer.FaultQuarantineClient,
@@ -177,16 +192,23 @@ func initializeCircuitBreaker(
 		return nil, fmt.Errorf("invalid circuit breaker duration %q: %w", cbConfig.Duration, err)
 	}
 
+	nodeSelector, err := parseCircuitBreakerNodeSelector(cbConfig.NodeSelector)
+	if err != nil {
+		return nil, err
+	}
+
 	slog.InfoContext(ctx, "Initializing circuit breaker",
 		"configMap", circuitBreakerName,
 		"namespace", namespace,
 		"percentage", cbConfig.Percentage,
-		"duration", cbConfig.Duration)
+		"duration", cbConfig.Duration,
+		"nodeSelector", nodeSelector.String())
 
 	cb, err := breaker.NewSlidingWindowBreaker(ctx, breaker.Config{
 		Window:             duration,
 		TripPercentage:     float64(cbConfig.Percentage),
 		K8sClient:          k8sClient,
+		NodeSelector:       nodeSelector,
 		ConfigMapName:      circuitBreakerName,
 		ConfigMapNamespace: namespace,
 	})

@@ -70,6 +70,7 @@ fault-quarantine:
     enabled: true
     percentage: 50
     duration: "5m"
+    nodeSelector: "nvidia.com/gpu.present=true"
 ```
 
 ### Parameters
@@ -78,10 +79,13 @@ fault-quarantine:
 Enables or disables circuit breaker protection. When disabled, unlimited nodes can be quarantined.
 
 #### percentage
-Maximum percentage of total cluster nodes that can be quarantined within the time window. When exceeded, the circuit breaker trips and blocks all new quarantine actions.
+Maximum percentage of selected nodes that can be quarantined within the time window. When exceeded, the circuit breaker trips and blocks all new quarantine actions.
 
 #### duration
 Time window for tracking cordon events. The circuit breaker counts unique node cordons within this sliding window.
+
+#### nodeSelector
+Kubernetes label selector for nodes included in circuit breaker accounting. The Helm default is `nvidia.com/gpu.present=true`, matching the default GPU-oriented quarantine rules. Set to `""` to include all nodes.
 
 ### Configuration Examples
 
@@ -91,6 +95,7 @@ circuitBreaker:
   enabled: true
   percentage: 20
   duration: "10m"
+  nodeSelector: "nvidia.com/gpu.present=true"
 ```
 
 Conservative:
@@ -99,6 +104,7 @@ circuitBreaker:
   enabled: true
   percentage: 75
   duration: "3m"
+  nodeSelector: ""
 ```
 
 Disabled:

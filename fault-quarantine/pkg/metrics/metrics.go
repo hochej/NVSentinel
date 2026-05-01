@@ -177,13 +177,13 @@ var (
 	FaultQuarantineBreakerUtilization = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "fault_quarantine_breaker_utilization",
-			Help: "Utilization of the fault quarantine breaker.",
+			Help: "Utilization of the fault quarantine breaker among nodes selected by circuitBreaker.nodeSelector.",
 		},
 	)
 	FaultQuarantineGetTotalNodesDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "fault_quarantine_get_total_nodes_duration_seconds",
-			Help:    "Duration of getTotalNodesWithRetry calls in seconds.",
+			Help:    "Duration of circuit breaker selected-node count calls in seconds.",
 			Buckets: prometheus.DefBuckets,
 		},
 		[]string{"result"},
@@ -191,14 +191,14 @@ var (
 	FaultQuarantineGetTotalNodesErrors = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "fault_quarantine_get_total_nodes_errors_total",
-			Help: "Total number of errors from getTotalNodesWithRetry.",
+			Help: "Total number of errors from circuit breaker selected-node count calls.",
 		},
 		[]string{"error_type"},
 	)
 	FaultQuarantineGetTotalNodesRetryAttempts = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "fault_quarantine_get_total_nodes_retry_attempts",
-			Help:    "Number of retry attempts needed for getTotalNodesWithRetry.",
+			Help:    "Number of retry attempts needed for circuit breaker selected-node count calls.",
 			Buckets: []float64{0, 1, 2, 3, 5, 10},
 		},
 	)

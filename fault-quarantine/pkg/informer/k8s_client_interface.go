@@ -18,6 +18,7 @@ import (
 	"context"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/breaker"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/config"
@@ -39,4 +40,5 @@ type K8sClientInterface interface {
 	ReadCursorMode(ctx context.Context, name, namespace string) (breaker.CursorMode, error)
 	WriteCursorMode(ctx context.Context, name, namespace string, mode breaker.CursorMode) error
 	GetTotalNodes(ctx context.Context) (int, error)
+	GetCircuitBreakerNodeScope(ctx context.Context, nodeName string, selector labels.Selector) (breaker.NodeScope, error)
 }

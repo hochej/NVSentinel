@@ -173,6 +173,39 @@ func (ni *NodeInformer) GetNodeCounts() (totalNodes int, quarantinedNodesMap map
 	return total, quarantinedMap, nil
 }
 
+// GetNodeScope returns the number of nodes selected by selector and whether nodeName
+// is selected. Both values are computed from a single informer cache snapshot.
+func (ni *NodeInformer) GetNodeScope(selector labels.Selector, nodeName string) (selectedNodes int, nodeInScope bool, err error) {
+	if !ni.HasSynced() {
+		return 0, false, fmt.Errorf("node informer cache not synced yet")
+	}
+
+	if selector == nil {
+		selector = labels.Everything()
+	}
+
+	allObjs := ni.informer.GetIndexer().List()
+
+	for _, obj := range allObjs {
+		node, ok := obj.(*v1.Node)
+		if !ok {
+			return 0, false, fmt.Errorf("expected node object, got %T", obj)
+		}
+
+		if !selector.Matches(labels.Set(node.Labels)) {
+			continue
+		}
+
+		selectedNodes++
+
+		if node.Name == nodeName {
+			nodeInScope = true
+		}
+	}
+
+	return selectedNodes, nodeInScope, nil
+}
+
 // GetNode retrieves a node from the informer's cache.
 func (ni *NodeInformer) GetNode(name string) (*v1.Node, error) {
 	return ni.lister.Get(name)

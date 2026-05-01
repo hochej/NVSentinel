@@ -290,6 +290,7 @@ func setupE2EReconcilerWithOptions(t *testing.T, ctx context.Context, cfg E2ERec
 			Window:             duration,
 			TripPercentage:     float64(percentage),
 			K8sClient:          fqClient,
+			NodeSelector:       cbConfig.NodeSelector,
 			ConfigMapName:      name,
 			ConfigMapNamespace: namespace,
 		})

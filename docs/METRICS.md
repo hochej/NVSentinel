@@ -60,11 +60,11 @@ This document outlines all Prometheus metrics exposed by NVSentinel components.
 
 | Metric Name | Type | Labels | Description |
 |------------|------|--------|-------------|
-| `fault_quarantine_breaker_state` | Gauge | `state` | State of the fault quarantine breaker |
-| `fault_quarantine_breaker_utilization` | Gauge | - | Utilization of the fault quarantine breaker |
-| `fault_quarantine_get_total_nodes_duration_seconds` | Histogram | `result` | Duration of getTotalNodesWithRetry calls in seconds |
-| `fault_quarantine_get_total_nodes_errors_total` | Counter | `error_type` | Total number of errors from getTotalNodesWithRetry |
-| `fault_quarantine_get_total_nodes_retry_attempts` | Histogram | - | Number of retry attempts needed for getTotalNodesWithRetry (buckets: 0, 1, 2, 3, 5, 10) |
+| `fault_quarantine_breaker_state` | Gauge | `state` | State of the fault quarantine breaker (`CLOSED`, `TRIPPED`, or metric-only `SCOPE_EMPTY`) |
+| `fault_quarantine_breaker_utilization` | Gauge | - | Utilization of the fault quarantine breaker among nodes selected by `circuitBreaker.nodeSelector` |
+| `fault_quarantine_get_total_nodes_duration_seconds` | Histogram | `result` | Duration of circuit breaker selected-node count calls in seconds |
+| `fault_quarantine_get_total_nodes_errors_total` | Counter | `error_type` | Total number of errors from circuit breaker selected-node count calls |
+| `fault_quarantine_get_total_nodes_retry_attempts` | Histogram | - | Number of retry attempts needed for circuit breaker selected-node count calls (buckets: 0, 1, 2, 3, 5, 10) |
 
 ---
 

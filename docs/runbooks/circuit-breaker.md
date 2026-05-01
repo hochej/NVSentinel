@@ -19,6 +19,8 @@ kubectl get cm circuit-breaker -n nvsentinel -o jsonpath='{.data.status}'
 - `TRIPPED` = protection mode active
 - `CLOSED` = normal operation
 
+If the Prometheus metric reports `fault_quarantine_breaker_state{state="SCOPE_EMPTY"} == 1`, the configured `circuitBreaker.nodeSelector` currently matches no nodes; event processing resumes when matching nodes appear.
+
 ### 2. Identify Cordoned Nodes
 
 ```bash

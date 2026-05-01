@@ -47,8 +47,9 @@ type faultQuarantineConfig struct {
 }
 
 type circuitBreakerConfig struct {
-	Percentage int    `toml:"percentage"`
-	Duration   string `toml:"duration"`
+	Percentage   int    `toml:"percentage"`
+	Duration     string `toml:"duration"`
+	NodeSelector string `toml:"nodeSelector"`
 }
 
 type QuarantineTestContext struct {

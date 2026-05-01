@@ -25,6 +25,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -128,6 +129,29 @@ func (c *FaultQuarantineClient) GetTotalNodes(ctx context.Context) (int, error) 
 	slog.DebugContext(ctx, "Got total nodes from NodeInformer cache", "totalNodes", totalNodes)
 
 	return totalNodes, nil
+}
+
+func (c *FaultQuarantineClient) GetCircuitBreakerNodeScope(
+	ctx context.Context,
+	nodeName string,
+	selector labels.Selector,
+) (breaker.NodeScope, error) {
+	if selector == nil {
+		selector = labels.Everything()
+	}
+
+	selectedNodes, nodeInScope, err := c.NodeInformer.GetNodeScope(selector, nodeName)
+	if err != nil {
+		return breaker.NodeScope{}, fmt.Errorf("failed to get circuit breaker node scope from informer: %w", err)
+	}
+
+	slog.DebugContext(ctx, "Got circuit breaker node scope from NodeInformer cache",
+		"node", nodeName,
+		"nodeInScope", nodeInScope,
+		"scopedNodeCount", selectedNodes,
+		"nodeSelector", selector.String())
+
+	return breaker.NodeScope{ScopedNodeCount: selectedNodes, NodeInScope: nodeInScope}, nil
 }
 
 func (c *FaultQuarantineClient) SetLabelKeys(cordonedReasonKey, uncordonedReasonKey string) {

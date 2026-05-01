@@ -31,6 +31,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -91,6 +92,41 @@ func (c *testK8sClient) GetTotalNodes(ctx context.Context) (int, error) {
 
 	allObjs := c.informer.GetIndexer().List()
 	return len(allObjs), nil
+}
+
+func (c *testK8sClient) GetCircuitBreakerNodeScope(
+	ctx context.Context,
+	nodeName string,
+	selector labels.Selector,
+) (NodeScope, error) {
+	if !c.informerSynced() {
+		return NodeScope{}, fmt.Errorf("node informer cache not synced yet")
+	}
+
+	if selector == nil {
+		selector = labels.Everything()
+	}
+
+	allObjs := c.informer.GetIndexer().List()
+	scope := NodeScope{}
+
+	for _, obj := range allObjs {
+		node, ok := obj.(*corev1.Node)
+		if !ok {
+			return NodeScope{}, fmt.Errorf("expected node object, got %T", obj)
+		}
+
+		if !selector.Matches(labels.Set(node.Labels)) {
+			continue
+		}
+
+		scope.ScopedNodeCount++
+		if node.Name == nodeName {
+			scope.NodeInScope = true
+		}
+	}
+
+	return scope, nil
 }
 
 func (c *testK8sClient) EnsureCircuitBreakerConfigMap(ctx context.Context, name, namespace string, initialStatus State) error {

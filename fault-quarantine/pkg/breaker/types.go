@@ -19,6 +19,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 type CursorMode string
@@ -31,6 +33,7 @@ const (
 // K8sClientOperations defines the minimal interface needed by the circuit breaker
 type K8sClientOperations interface {
 	GetTotalNodes(ctx context.Context) (int, error)
+	GetCircuitBreakerNodeScope(ctx context.Context, nodeName string, selector labels.Selector) (NodeScope, error)
 	EnsureCircuitBreakerConfigMap(ctx context.Context, name, namespace string, initialStatus State) error
 	ReadCircuitBreakerState(ctx context.Context, name, namespace string) (State, error)
 	WriteCircuitBreakerState(ctx context.Context, name, namespace string, status State) error
@@ -38,12 +41,26 @@ type K8sClientOperations interface {
 	WriteCursorMode(ctx context.Context, name, namespace string, mode CursorMode) error
 }
 
+// NodeScope is a snapshot of circuit-breaker node-selector scope.
+type NodeScope struct {
+	ScopedNodeCount int
+	NodeInScope     bool
+}
+
+// CheckResult contains the outcome of an event-scoped circuit-breaker check.
+type CheckResult struct {
+	Tripped         bool
+	NodeInScope     bool
+	ScopedNodeCount int
+}
+
 // CircuitBreakerConfig holds the Kubernetes-specific configuration for the circuit breaker
 type CircuitBreakerConfig struct {
-	Namespace  string
-	Name       string
-	Percentage int
-	Duration   time.Duration
+	Namespace    string
+	Name         string
+	Percentage   int
+	Duration     time.Duration
+	NodeSelector labels.Selector
 }
 
 // State represents the current state of the circuit breaker
@@ -54,11 +71,20 @@ const (
 	StateClosed State = "CLOSED"
 	// StateTripped indicates the breaker is blocking operations
 	StateTripped State = "TRIPPED"
+	// StateScopeEmpty indicates the configured selector currently matches no nodes.
+	// It is exposed via metrics only and is not persisted in the ConfigMap.
+	StateScopeEmpty State = "SCOPE_EMPTY"
 )
 
 type CircuitBreaker interface {
-	// AddCordonEvent records a node cordoning event in the sliding window
+	// AddCordonEvent records an in-scope node cordoning event in the sliding window
 	AddCordonEvent(nodeName string)
+	// AddCordonEventWithScope records a node cordoning event with its selector membership.
+	AddCordonEventWithScope(nodeName string, inScope bool)
+	// CheckCircuitBreakerForNode checks if the breaker should prevent cordoning nodeName
+	// and returns nodeName's circuit-breaker scope membership from the same cache snapshot
+	// used to compute the scoped denominator.
+	CheckCircuitBreakerForNode(ctx context.Context, nodeName string) (CheckResult, error)
 	// IsTripped checks if the breaker should prevent further cordoning
 	IsTripped(ctx context.Context) (bool, error)
 	// ForceState manually sets the breaker state (CLOSED or TRIPPED)
@@ -77,13 +103,17 @@ type Config struct {
 	// Default: 5 minutes. Events older than this window are automatically discarded.
 	Window time.Duration
 
-	// TripPercentage is the fraction of total nodes that, if exceeded by recent cordon
-	// events within Window, will trip the breaker (e.g., 50 for 50%).
-	// Default: 50 (50% of nodes).
+	// TripPercentage is the fraction of selected nodes that, if exceeded by recent
+	// in-scope cordon events within Window, will trip the breaker (e.g., 50 for 50%).
+	// Default: 50 (50% of selected nodes).
 	TripPercentage float64
 
 	// K8sClient provides operations for node counts and ConfigMap state persistence
 	K8sClient K8sClientOperations
+
+	// NodeSelector selects the nodes that participate in circuit-breaker accounting.
+	// Empty/nil means all nodes.
+	NodeSelector labels.Selector
 
 	// ConfigMapName is the name of the ConfigMap used for state persistence
 	ConfigMapName string
@@ -91,7 +121,7 @@ type Config struct {
 	// ConfigMapNamespace is the namespace of the ConfigMap
 	ConfigMapNamespace string
 
-	// MaxRetries is the maximum number of retry attempts when GetTotalNodes returns 0
+	// MaxRetries is the maximum number of retry attempts when the node selector matches 0 nodes.
 	// Default: 10 retries (allows ~30 seconds for cache sync with exponential backoff)
 	MaxRetries int
 
@@ -124,12 +154,18 @@ type slidingWindowBreaker struct {
 	startTime time.Time
 
 	// Node tracking for unique cordon events within the sliding window
-	// nodeToIndex maps node name to the bucket index where it was last cordoned
-	nodeToIndex map[string]int
-	// indexToNodes maps bucket index to a set of node names cordoned in that bucket
-	indexToNodes map[int]map[string]bool
+	// nodeToEvent maps node name to the bucket index where it was last cordoned and
+	// whether that event was in the configured circuit-breaker node scope.
+	nodeToEvent map[string]cordonEvent
+	// indexToNodes maps bucket index to the node events recorded in that bucket.
+	indexToNodes map[int]map[string]cordonEvent
 
 	// state is the current breaker state (CLOSED or TRIPPED)
 	// Can be manually forced via ForceState() or automatically set by IsTripped()
 	state State
+}
+
+type cordonEvent struct {
+	bucketIndex int
+	inScope     bool
 }
