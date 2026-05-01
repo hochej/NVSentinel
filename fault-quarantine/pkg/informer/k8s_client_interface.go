@@ -39,6 +39,5 @@ type K8sClientInterface interface {
 	WriteCircuitBreakerState(ctx context.Context, name, namespace string, state breaker.State) error
 	ReadCursorMode(ctx context.Context, name, namespace string) (breaker.CursorMode, error)
 	WriteCursorMode(ctx context.Context, name, namespace string, mode breaker.CursorMode) error
-	GetTotalNodes(ctx context.Context) (int, error)
 	GetCircuitBreakerNodeScope(ctx context.Context, nodeName string, selector labels.Selector) (breaker.NodeScope, error)
 }

@@ -120,17 +120,6 @@ func (c *FaultQuarantineClient) EnsureCircuitBreakerConfigMap(ctx context.Contex
 	return nil
 }
 
-func (c *FaultQuarantineClient) GetTotalNodes(ctx context.Context) (int, error) {
-	totalNodes, _, err := c.NodeInformer.GetNodeCounts()
-	if err != nil {
-		return 0, fmt.Errorf("failed to get node counts from informer: %w", err)
-	}
-
-	slog.DebugContext(ctx, "Got total nodes from NodeInformer cache", "totalNodes", totalNodes)
-
-	return totalNodes, nil
-}
-
 func (c *FaultQuarantineClient) GetCircuitBreakerNodeScope(
 	ctx context.Context,
 	nodeName string,

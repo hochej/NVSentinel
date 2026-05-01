@@ -197,6 +197,21 @@ func TestCircuitBreakerEmptyScopeReturnsSentinelError(t *testing.T) {
 	require.Equal(t, StateClosed, b.CurrentState())
 }
 
+func TestCircuitBreakerEmptyScopeAllowsOutOfScopeNodeEvent(t *testing.T) {
+	ctx := context.Background()
+	gpuSelector := labels.SelectorFromSet(labels.Set{"nvidia.com/gpu.present": "true"})
+	client := newMemoryScopeClient(map[string]labels.Set{
+		"cpu-0": {},
+	})
+	b := newMemoryBreaker(t, client, gpuSelector, 50)
+
+	result, err := b.CheckCircuitBreakerForNode(ctx, "cpu-0")
+	require.NoError(t, err)
+	require.False(t, result.Tripped)
+	require.False(t, result.NodeInScope)
+	require.Equal(t, 0, result.ScopedNodeCount)
+}
+
 func TestCircuitBreakerRetriesTransientNodeScopeErrors(t *testing.T) {
 	ctx := context.Background()
 	client := &flakyScopeClient{
@@ -214,7 +229,7 @@ func TestCircuitBreakerRetriesTransientNodeScopeErrors(t *testing.T) {
 	require.Equal(t, 1, result.ScopedNodeCount)
 }
 
-func TestCheckCircuitBreakerForNodeReportsScopeWhenAlreadyTripped(t *testing.T) {
+func TestCheckCircuitBreakerForNodeSkipsScopeLookupWhenAlreadyTripped(t *testing.T) {
 	ctx := context.Background()
 	gpuSelector := labels.SelectorFromSet(labels.Set{"nvidia.com/gpu.present": "true"})
 	client := newMemoryScopeClient(map[string]labels.Set{
@@ -227,8 +242,8 @@ func TestCheckCircuitBreakerForNodeReportsScopeWhenAlreadyTripped(t *testing.T) 
 	result, err := b.CheckCircuitBreakerForNode(ctx, "gpu-0")
 	require.NoError(t, err)
 	require.True(t, result.Tripped)
-	require.True(t, result.NodeInScope)
-	require.Equal(t, 1, result.ScopedNodeCount)
+	require.False(t, result.NodeInScope)
+	require.Equal(t, 0, result.ScopedNodeCount)
 }
 
 func TestScopedEventStaysCountedAfterOutOfScopeEventForSameNode(t *testing.T) {

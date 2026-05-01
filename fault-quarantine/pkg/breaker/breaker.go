@@ -163,7 +163,7 @@ func (b *slidingWindowBreaker) AddCordonEventWithScope(nodeName string, inScope 
 	b.slideWindow(now)
 
 	if oldEvent, exists := b.nodeToEvent[nodeName]; exists {
-		if !inScope && oldEvent.inScope {
+		if !inScope {
 			slog.Debug("Ignoring out-of-scope cordon event for node with existing in-scope breaker event",
 				"node", nodeName,
 				"bucket", oldEvent.bucketIndex)
@@ -175,14 +175,11 @@ func (b *slidingWindowBreaker) AddCordonEventWithScope(nodeName string, inScope 
 			delete(oldBucketNodes, nodeName)
 		}
 
-		if oldEvent.inScope {
-			b.buckets[oldEvent.bucketIndex]--
-		}
+		b.buckets[oldEvent.bucketIndex]--
 	}
 
 	if !inScope {
 		slog.Debug("Skipping out-of-scope cordon event", "node", nodeName)
-		delete(b.nodeToEvent, nodeName)
 
 		return
 	}
@@ -238,20 +235,7 @@ func (b *slidingWindowBreaker) checkCircuitBreaker(ctx context.Context, nodeName
 	b.mu.RUnlock()
 
 	if alreadyTripped {
-		if nodeName == "" {
-			return CheckResult{Tripped: true}, nil
-		}
-
-		scope, err := b.cfg.K8sClient.GetCircuitBreakerNodeScope(ctx, nodeName, b.cfg.NodeSelector)
-		if err != nil {
-			return CheckResult{}, fmt.Errorf("failed to get circuit breaker node scope while tripped: %w", err)
-		}
-
-		return CheckResult{
-			Tripped:         true,
-			NodeInScope:     scope.NodeInScope,
-			ScopedNodeCount: scope.ScopedNodeCount,
-		}, nil
+		return CheckResult{Tripped: true}, nil
 	}
 
 	scope, err := b.getNodeScopeWithRetry(ctx, nodeName)
@@ -263,6 +247,14 @@ func (b *slidingWindowBreaker) checkCircuitBreaker(ctx context.Context, nodeName
 		slog.ErrorContext(ctx, "Failed to get circuit breaker node scope after retries", "error", err)
 
 		return CheckResult{}, fmt.Errorf("failed to get circuit breaker node scope after retries: %w", err)
+	}
+
+	if scope.ScopedNodeCount == 0 {
+		return CheckResult{
+			Tripped:         false,
+			NodeInScope:     scope.NodeInScope,
+			ScopedNodeCount: scope.ScopedNodeCount,
+		}, nil
 	}
 
 	now := time.Now()
@@ -347,8 +339,10 @@ func (b *slidingWindowBreaker) SetCursorMode(ctx context.Context, mode CursorMod
 }
 
 // getNodeScopeWithRetry gets the selected node count and optional node membership with
-// retry logic and exponential backoff. A selector that matches zero nodes is reported as
-// ErrEmptyCircuitBreakerScope, not ErrRetryExhausted, so the reconciler can pause safely.
+// retry logic and exponential backoff. For global checks (nodeName == ""), a selector
+// that matches zero nodes is reported as ErrEmptyCircuitBreakerScope, not ErrRetryExhausted,
+// so the reconciler can pause safely. Event-scoped checks for an out-of-scope node are
+// allowed through even when the selector currently matches zero nodes.
 func (b *slidingWindowBreaker) getNodeScopeWithRetry(ctx context.Context, nodeName string) (NodeScope, error) {
 	startTime := time.Now()
 
@@ -374,7 +368,7 @@ func (b *slidingWindowBreaker) getNodeScopeWithRetry(ctx context.Context, nodeNa
 		if err != nil {
 			lastErr = err
 			b.logGetNodeScopeError(err, attempt, maxRetries)
-		} else if scope.ScopedNodeCount > 0 {
+		} else if scope.ScopedNodeCount > 0 || nodeName != "" {
 			result = "success"
 
 			metrics.FaultQuarantineGetTotalNodesRetryAttempts.Observe(float64(attempt))
@@ -444,7 +438,7 @@ func (b *slidingWindowBreaker) logGetNodeScopeError(err error, attempt, maxRetri
 		"error", err)
 }
 
-// handleSuccessfulNodeScope handles the success case when selected nodes > 0.
+// handleSuccessfulNodeScope handles a successful scoped-node lookup.
 func (b *slidingWindowBreaker) handleSuccessfulNodeScope(scope NodeScope, attempt int) NodeScope {
 	if attempt > 0 {
 		slog.Info("Circuit breaker retry successful",

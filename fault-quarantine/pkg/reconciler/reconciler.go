@@ -52,6 +52,7 @@ const (
 	EventProcessingStatusPartialRecovery = "partial_recovery"
 
 	circuitBreakerScopeRetryDelay = 30 * time.Second
+	circuitBreakerErrorRetryDelay = 5 * time.Second
 )
 
 type ReconcilerConfig struct {
@@ -503,10 +504,17 @@ func (r *Reconciler) checkCircuitBreakerAndHalt(ctx context.Context, event *prot
 	for {
 		result, err := r.cb.CheckCircuitBreakerForNode(ctx, event.NodeName)
 		if err != nil {
+			if errors.Is(err, breaker.ErrRetryExhausted) {
+				slog.ErrorContext(ctx, "Circuit breaker node scope retries exhausted; terminating for pod restart", "error", err)
+				panic(fmt.Errorf("circuit breaker node scope retries exhausted: %w", err))
+			}
+
+			retryDelay := circuitBreakerErrorRetryDelay
 			if errors.Is(err, breaker.ErrEmptyCircuitBreakerScope) {
 				slog.WarnContext(ctx, "Circuit breaker node selector matches no nodes; pausing event processing until scope is non-empty",
 					"node", event.NodeName)
 				span.SetAttributes(attribute.String("fault_quarantine.circuit_breaker.state", "scope_empty"))
+				retryDelay = circuitBreakerScopeRetryDelay
 			} else {
 				slog.ErrorContext(ctx, "Error checking if circuit breaker is tripped", "error", err)
 				tracing.RecordError(span, err)
@@ -516,7 +524,7 @@ func (r *Reconciler) checkCircuitBreakerAndHalt(ctx context.Context, event *prot
 				)
 			}
 
-			if !waitForCircuitBreakerRetry(ctx) {
+			if !waitForCircuitBreakerRetry(ctx, retryDelay) {
 				return false, true
 			}
 
@@ -540,11 +548,11 @@ func (r *Reconciler) checkCircuitBreakerAndHalt(ctx context.Context, event *prot
 	}
 }
 
-func waitForCircuitBreakerRetry(ctx context.Context) bool {
+func waitForCircuitBreakerRetry(ctx context.Context, delay time.Duration) bool {
 	select {
 	case <-ctx.Done():
 		return false
-	case <-time.After(circuitBreakerScopeRetryDelay):
+	case <-time.After(delay):
 		return true
 	}
 }
